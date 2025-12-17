@@ -1,1 +1,1 @@
-# notion-synthesizer
+# memo-synthesizer
