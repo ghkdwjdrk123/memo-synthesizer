@@ -456,7 +456,7 @@ class SupabaseService:
             limit: 반환할 최대 개수 (기본 10)
 
         Returns:
-            미사용 thought pairs 목록 (similarity_score DESC 정렬)
+            미사용 thought pairs 목록 (similarity_score ASC 정렬 - 낮은 유사도부터)
         """
         await self._ensure_initialized()
 
@@ -465,7 +465,7 @@ class SupabaseService:
                 self.client.table("thought_pairs")
                 .select("*")
                 .eq("is_used_in_essay", False)
-                .order("similarity_score", desc=True)
+                .order("similarity_score", desc=False)  # 낮은 유사도부터 선택 (창의적 조합)
                 .limit(limit)
                 .execute()
             )

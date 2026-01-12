@@ -94,7 +94,7 @@ Embedding: [vectors...] (1536 values)
 1. **Calculate Similarities**
    - Total pairs to evaluate: C(10,2) = 45 pairs
    - Use pgvector cosine similarity: `1 - (embedding <=> embedding)`
-   - Filter range: 0.3 ≤ similarity ≤ 0.7 (weak connections)
+   - Filter range: 0.05 ≤ similarity ≤ 0.35 (낮은 유사도 = 서로 다른 아이디어, 창의적 조합)
 
 2. **LLM Scoring**
    - Model: Claude 3.5 Sonnet
@@ -112,7 +112,7 @@ Embedding: [vectors...] (1536 values)
 {
   "selected_pairs": 5,
   "total_candidates": 15,  // approximate, depends on similarity distribution
-  "similarity_range": [0.3, 0.7],
+  "similarity_range": [0.05, 0.35],
   "execution_time": "~10-15 seconds"
 }
 ```

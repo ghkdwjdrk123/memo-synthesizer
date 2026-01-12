@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* 브런치 스타일 전역 설정 */
+  html {
+    @apply antialiased;
+  }
+
+  body {
+    @apply bg-brunch-bg text-brunch-text;
+    font-family: var(--font-sans), 'Malgun Gothic', sans-serif;
+    line-height: 1.5;
+  }
+
+  /* 제목 스타일 */
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-normal;
+  }
+
+  /* 링크 스타일 */
+  a {
+    @apply text-brunch-accent transition-colors;
+  }
+
+  a:hover {
+    @apply opacity-80;
+  }
+}
+
+@layer components {
+  /* 브런치 스타일 카드 */
+  .brunch-card {
+    @apply bg-white rounded-lg border border-brunch-border p-8;
+    @apply transition-all duration-300 ease-out;
+  }
+
+  .brunch-card:hover {
+    @apply shadow-brunch-hover -translate-y-1;
+  }
+
+  /* 브런치 제목 */
+  .brunch-title {
+    @apply text-brunch-title font-normal;
+    letter-spacing: -1px;
+    line-height: 1.3;
+  }
+
+  /* 브런치 본문 */
+  .brunch-body {
+    @apply text-brunch-body;
+    line-height: 1.5;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}

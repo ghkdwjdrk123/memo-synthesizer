@@ -166,7 +166,7 @@ GET  /health                         # 서버 상태
 - **Model:** Claude 3.5 Sonnet
 
 ### 2. score_pairs (Step 3)
-- **Input:** 후보 페어 목록 (similarity 0.3~0.7)
+- **Input:** 후보 페어 목록 (similarity 0.05~0.35, 낮은 유사도 = 서로 다른 아이디어)
 - **Output:** 각 페어의 논리적 확장 가능성 점수 (0-100)
 - **Model:** Claude 3.5 Sonnet
 
@@ -264,8 +264,8 @@ BATCH_SIZE=10
 MAX_RETRIES=3
 
 # pgvector
-SIMILARITY_MIN=0.3
-SIMILARITY_MAX=0.7
+SIMILARITY_MIN=0.05  # 낮은 유사도 = 서로 다른 아이디어, 창의적 조합
+SIMILARITY_MAX=0.35  # 너무 유사하면 새로운 통찰이 없음
 EMBEDDING_DIMENSION=1536
 ```
 
