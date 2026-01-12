@@ -6,12 +6,14 @@ RAW → NORMALIZED → ZK → Essay 전체 파이프라인 엔드포인트.
 
 import logging
 from datetime import datetime
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from schemas.raw import ImportResult, RawNoteCreate
 from schemas.normalized import ThoughtUnitCreate
 from schemas.zk import ThoughtPairCandidate, ThoughtPairCreate, PairScore
+from schemas.essay import EssayCreate
 from services.notion_service import NotionService
 from services.ai_service import AIService, get_ai_service
 from services.supabase_service import SupabaseService, get_supabase_service
@@ -561,11 +563,12 @@ async def run_all(
     max_similarity: float = Query(default=0.35, ge=0, le=1, description="Step 3용 최대 유사도"),
     min_score: int = Query(default=65, ge=0, le=100, description="Step 3용 최소 창의적 연결 점수 (threshold)"),
     top_n: int = Query(default=5, ge=1, le=20, description="Step 3용 페어 개수"),
+    max_essay_pairs: int = Query(default=5, ge=1, le=10, description="Step 4용 에세이 생성할 페어 개수"),
     supabase_service: SupabaseService = Depends(get_supabase_service),
     ai_service: AIService = Depends(get_ai_service),
 ):
     """
-    전체 파이프라인 (Step 1 → Step 2 → Step 3) 순차 실행.
+    전체 파이프라인 (Step 1 → Step 2 → Step 3 → Step 4) 순차 실행.
 
     Args:
         page_size: Step 1에서 가져올 메모 수 (1-100)
@@ -573,6 +576,7 @@ async def run_all(
         max_similarity: Step 3용 최대 유사도 (0-1, 기본 0.35)
         min_score: Step 3용 최소 창의적 연결 점수 (0-100, 기본 65)
         top_n: Step 3용 선택할 페어 개수 (1-20)
+        max_essay_pairs: Step 4용 에세이 생성할 페어 개수 (1-10)
         supabase_service: Supabase 서비스 (DI)
         ai_service: AI 서비스 (DI)
 
@@ -584,11 +588,12 @@ async def run_all(
         "step1": {},
         "step2": {},
         "step3": {},
+        "step4": {},
         "errors": [],
     }
 
     try:
-        logger.info("Starting full pipeline (Step 1 → Step 2 → Step 3)...")
+        logger.info("Starting full pipeline (Step 1 → Step 2 → Step 3 → Step 4)...")
 
         # Step 1: Notion에서 메모 가져오기
         logger.info("=== Step 1: Import from Notion ===")
@@ -660,12 +665,31 @@ async def run_all(
             result["errors"].append(error_msg)
             result["step3"] = {"error": str(e)}
 
+        # Step 4: 에세이 생성
+        logger.info("=== Step 4: Generate Essays ===")
+        try:
+            step4_result = await generate_essays(
+                max_pairs=max_essay_pairs,
+                supabase_service=supabase_service,
+                ai_service=ai_service
+            )
+            result["step4"] = {"essays": step4_result.get("essays_generated", 0)}
+            if step4_result.get("errors"):
+                result["errors"].extend([f"Step4: {e}" for e in step4_result["errors"]])
+            logger.info(f"Step 4 completed: {step4_result.get('essays_generated', 0)} essays generated")
+        except Exception as e:
+            error_msg = f"Step 4 failed: {str(e)}"
+            logger.error(error_msg)
+            result["errors"].append(error_msg)
+            result["step4"] = {"error": str(e)}
+
         # 성공 여부 판단 (적어도 Step 1이 성공했으면 부분 성공)
         result["success"] = result["step1"].get("imported", 0) > 0
 
         logger.info(
             f"Full pipeline completed: "
-            f"Step1={result['step1']}, Step2={result['step2']}, Step3={result['step3']}"
+            f"Step1={result['step1']}, Step2={result['step2']}, "
+            f"Step3={result['step3']}, Step4={result['step4']}"
         )
 
     except Exception as e:
@@ -674,3 +698,158 @@ async def run_all(
         raise HTTPException(status_code=500, detail=str(e))
 
     return result
+
+
+@router.post("/generate-essays")
+async def generate_essays(
+    max_pairs: int = Query(default=5, ge=1, le=10, description="처리할 최대 페어 개수"),
+    supabase_service: SupabaseService = Depends(get_supabase_service),
+    ai_service: AIService = Depends(get_ai_service),
+):
+    """
+    Step 4: Essay 글감 생성
+
+    프로세스:
+    1. get_unused_thought_pairs()로 미사용 페어 조회
+    2. 각 페어에 대해:
+       a. get_pair_with_thoughts()로 전체 정보 가져오기
+       b. ai_service.generate_essay()로 Claude 호출
+       c. 에세이 생성 (title, outline, reason)
+    3. insert_essays_batch()로 배치 저장
+    4. 각 페어의 is_used_in_essay = TRUE 업데이트
+    5. 생성된 에세이 목록 반환
+
+    Args:
+        max_pairs: 처리할 최대 페어 개수 (기본 5, 최대 10)
+
+    Returns:
+        {
+            "success": true,
+            "pairs_processed": 5,
+            "essays_generated": 5,
+            "essays": [...],
+            "errors": []
+        }
+
+    Note:
+        - 부분 성공 허용: 일부 페어 실패해도 성공한 것은 저장
+        - 각 페어는 독립적으로 처리 (한 페어 실패가 다른 페어에 영향 없음)
+    """
+    result = {
+        "success": False,
+        "pairs_processed": 0,
+        "essays_generated": 0,
+        "essays": [],
+        "errors": [],
+    }
+
+    try:
+        # 1. 미사용 페어 조회
+        logger.info(f"Step 4: Fetching up to {max_pairs} unused pairs...")
+        unused_pairs = await supabase_service.get_unused_thought_pairs(limit=max_pairs)
+
+        if not unused_pairs:
+            logger.warning("No unused pairs found")
+            result["errors"].append("No unused pairs available. Run Step 3 first.")
+            return result
+
+        logger.info(f"Found {len(unused_pairs)} unused pairs")
+
+        # 2. 각 페어에 대해 에세이 생성
+        generated_essays: List[EssayCreate] = []
+        processed_pair_ids: List[int] = []
+
+        for pair in unused_pairs:
+            pair_id = pair["id"]
+            try:
+                result["pairs_processed"] += 1
+
+                # 2a. 페어 전체 정보 가져오기
+                pair_data = await supabase_service.get_pair_with_thoughts(pair_id)
+
+                # 2b. Claude로 에세이 생성
+                logger.info(f"Generating essay for pair {pair_id}...")
+                essay_dict = await ai_service.generate_essay(pair_data)
+
+                # 2c. EssayCreate 모델 생성
+                essay = EssayCreate(
+                    title=essay_dict["title"],
+                    outline=essay_dict["outline"],
+                    used_thoughts=essay_dict["used_thoughts"],
+                    reason=essay_dict["reason"],
+                    pair_id=pair_id
+                )
+
+                generated_essays.append(essay)
+                processed_pair_ids.append(pair_id)
+                logger.info(f"✓ Essay generated for pair {pair_id}: {essay.title[:50]}...")
+
+            except Exception as e:
+                error_msg = f"Failed to generate essay for pair {pair_id}: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                result["errors"].append(error_msg)
+                # 계속 진행 (부분 성공 허용)
+
+        # 3. 생성된 에세이 배치 저장
+        if generated_essays:
+            logger.info(f"Saving {len(generated_essays)} essays to DB...")
+            saved_essays = await supabase_service.insert_essays_batch(generated_essays)
+            result["essays_generated"] = len(saved_essays)
+            result["essays"] = saved_essays
+
+            # 4. 사용된 페어 상태 업데이트
+            logger.info("Updating pair usage status...")
+            for pair_id in processed_pair_ids:
+                try:
+                    await supabase_service.update_pair_used_status(pair_id, is_used=True)
+                except Exception as e:
+                    logger.error(f"Failed to update pair {pair_id} status: {e}")
+                    # 에러 무시 (에세이는 이미 저장됨)
+
+            logger.info(f"✓ Step 4 completed: {len(saved_essays)} essays generated")
+            result["success"] = True
+        else:
+            logger.warning("No essays were successfully generated")
+            result["errors"].append("All essay generation attempts failed")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Step 4 failed: {e}", exc_info=True)
+        result["errors"].append(f"Pipeline error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return result
+
+
+@router.get("/essays")
+async def get_essays_list(
+    limit: int = Query(default=10, ge=1, le=100, description="최대 반환 개수"),
+    offset: int = Query(default=0, ge=0, description="건너뛸 개수"),
+    supabase_service: SupabaseService = Depends(get_supabase_service),
+):
+    """
+    저장된 에세이 목록 조회 (최신순).
+
+    Args:
+        limit: 최대 반환 개수 (기본 10)
+        offset: 건너뛸 개수 (페이지네이션)
+
+    Returns:
+        {
+            "total": int,
+            "essays": [...]
+        }
+    """
+    try:
+        essays = await supabase_service.get_essays(limit=limit, offset=offset)
+
+        # TODO: total count 쿼리 추가 (현재는 반환된 개수로 대체)
+        return {
+            "total": len(essays),
+            "essays": essays
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get essays: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

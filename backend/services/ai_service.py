@@ -581,6 +581,163 @@ JSON만 출력하세요. 다른 텍스트는 포함하지 마세요."""
 - connection_reason에 줄바꿈, 따옴표 금지
 - JSON만 출력 (설명 금지)"""
 
+    async def generate_essay(
+        self,
+        pair_data: dict,
+    ) -> dict:
+        """
+        단일 페어로부터 에세이 글감 생성.
+
+        Args:
+            pair_data: get_pair_with_thoughts() 결과
+                {
+                    "pair_id": int,
+                    "similarity_score": float,
+                    "connection_reason": str,
+                    "thought_a": {
+                        "id": int,
+                        "claim": str,
+                        "context": str | None,
+                        "source_title": str,
+                        "source_url": str
+                    },
+                    "thought_b": { ... }
+                }
+
+        Returns:
+            {
+                "title": str,  # 5-100자
+                "outline": [str, str, str],  # 정확히 3개
+                "reason": str,  # 최대 300자
+                "used_thoughts": [
+                    {
+                        "thought_id": int,
+                        "claim": str,
+                        "source_title": str,
+                        "source_url": str
+                    }
+                ]
+            }
+
+        Raises:
+            ValueError: Claude 응답 파싱 실패
+            ValidationError: Pydantic 검증 실패
+        """
+        # 데이터 추출
+        thought_a = pair_data["thought_a"]
+        thought_b = pair_data["thought_b"]
+        similarity_score = pair_data["similarity_score"]
+        connection_reason = pair_data["connection_reason"]
+
+        system_message = """당신은 창의적인 글감을 만드는 전문가입니다.
+
+두 개의 서로 다른 사고 단위(thought unit)가 주어졌을 때, 이들을 연결하여 신선하고 흥미로운 글감(essay prompt)을 생성하세요.
+
+출력 형식:
+1. **제목 (title)**: 글감의 핵심을 담은 제목 (5-100자)
+   - 두 아이디어의 연결을 암시하되, 너무 직설적이지 않게
+   - 호기심을 자극하는 제목
+
+2. **3단 개요 (outline)**: 글의 구조를 나타내는 3개 문장
+   - 1단: 첫 번째 사고 단위 소개 또는 배경 설정
+   - 2단: 두 번째 사고 단위 도입 및 연결점 탐색
+   - 3단: 통합된 통찰 또는 새로운 질문 제시
+   - 각 문장은 50-200자
+
+3. **이 조합을 선택한 이유 (reason)**: 왜 이 두 아이디어를 연결하면 흥미로운 글이 나올지 설명 (50-300자)
+   - 독자가 얻을 수 있는 새로운 시각
+   - 두 도메인의 의외의 연결점
+
+중요 원칙:
+- 억지 연결 지양: 자연스러운 흐름 유지
+- 구체적 예시: 추상적 개념만 나열하지 말고 구체적 상황 제시
+- 독자 중심: 실제로 읽고 싶은 글감인지 고려"""
+
+        prompt = f"""다음 두 사고 단위를 바탕으로 글감을 생성하세요.
+
+**Thought A** (출처: {thought_a['source_title']})
+- Claim: {thought_a['claim']}
+- Context: {thought_a.get('context') or '없음'}
+- 출처 URL: {thought_a['source_url']}
+
+**Thought B** (출처: {thought_b['source_title']})
+- Claim: {thought_b['claim']}
+- Context: {thought_b.get('context') or '없음'}
+- 출처 URL: {thought_b['source_url']}
+
+**두 아이디어의 연결 이유** (Step 3에서 평가):
+{connection_reason}
+
+**유사도**: {similarity_score:.3f} (낮은 값 = 서로 다른 도메인)
+
+---
+
+JSON 형식으로 응답:
+{{
+  "title": "글감 제목 (5-100자)",
+  "outline": [
+    "1단: 첫 번째 아이디어 소개...",
+    "2단: 두 번째 아이디어와 연결...",
+    "3단: 통합된 통찰..."
+  ],
+  "reason": "이 조합을 선택한 이유 (50-300자)"
+}}
+
+중요:
+- outline은 정확히 3개 문장
+- reason은 한 줄로 작성 (줄바꿈 금지)
+- JSON만 반환"""
+
+        try:
+            # Claude API 호출
+            result = await self.generate_content_with_claude(
+                prompt=prompt,
+                system_message=system_message,
+                model="claude-sonnet-4-5-20250929",
+                max_tokens=2000,
+                temperature=1.0,
+            )
+
+            if not result["success"]:
+                raise Exception(
+                    f"Claude API error: {result.get('error', 'Unknown error')}"
+                )
+
+            raw_content = result["content"]
+
+            # safe_json_parse 사용
+            parsed_data = safe_json_parse(raw_content)
+
+            if parsed_data is None:
+                logger.error(f"JSON parse failed. Raw content: {raw_content[:500]}")
+                raise ValueError("Invalid JSON response from Claude")
+
+            # used_thoughts 리스트 생성
+            used_thoughts = [
+                {
+                    "thought_id": thought_a["id"],
+                    "claim": thought_a["claim"],
+                    "source_title": thought_a["source_title"],
+                    "source_url": thought_a["source_url"]
+                },
+                {
+                    "thought_id": thought_b["id"],
+                    "claim": thought_b["claim"],
+                    "source_title": thought_b["source_title"],
+                    "source_url": thought_b["source_url"]
+                }
+            ]
+
+            # 응답에 used_thoughts 추가
+            parsed_data["used_thoughts"] = used_thoughts
+
+            logger.info(f"Essay generated: {parsed_data.get('title', '')[:50]}...")
+            return parsed_data
+
+        except Exception as e:
+            logger.error(f"Failed to generate essay: {e}")
+            raise
+
 
 def get_ai_service() -> AIService:
     """

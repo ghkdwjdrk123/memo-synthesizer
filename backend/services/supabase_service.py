@@ -620,6 +620,165 @@ class SupabaseService:
             logger.error(f"Failed to get pair {pair_id} with thoughts: {e}")
             raise
 
+    # ========================
+    # Essay CRUD Methods (Step 4)
+    # ========================
+
+    async def insert_essay(self, essay: "EssayCreate") -> dict:
+        """
+        essays 테이블에 단일 에세이 저장.
+
+        Args:
+            essay: EssayCreate 모델 인스턴스
+
+        Returns:
+            {
+                "id": int,
+                "type": str,
+                "title": str,
+                "outline": list[str],
+                "used_thoughts_json": list[dict],
+                "reason": str,
+                "pair_id": int,
+                "generated_at": str (ISO format)
+            }
+
+        Raises:
+            Exception: DB 저장 실패 시
+        """
+        await self._ensure_initialized()
+
+        try:
+            # JSONB 필드 직렬화
+            essay_dict = {
+                "type": essay.type,
+                "title": essay.title,
+                "outline": essay.outline,  # list → JSONB (자동)
+                "used_thoughts_json": [t.model_dump() for t in essay.used_thoughts],  # JSONB
+                "reason": essay.reason,
+                "pair_id": essay.pair_id
+            }
+
+            response = await self.client.table("essays")\
+                .insert(essay_dict)\
+                .execute()
+
+            inserted = response.data[0]
+            logger.info(f"Inserted essay ID {inserted['id']} for pair {essay.pair_id}")
+            return inserted
+
+        except Exception as e:
+            logger.error(f"Failed to insert essay: {e}")
+            logger.error(f"Essay data: {essay_dict}")
+            raise
+
+    async def insert_essays_batch(self, essays: List["EssayCreate"]) -> List[dict]:
+        """
+        여러 에세이 배치 저장.
+
+        Args:
+            essays: EssayCreate 모델 리스트
+
+        Returns:
+            저장된 에세이 리스트
+
+        Note:
+            - UPSERT는 하지 않음 (중복 방지는 pair_id 외래키로 보장)
+            - 실패 시 전체 롤백
+        """
+        await self._ensure_initialized()
+
+        if not essays:
+            return []
+
+        try:
+            essays_dict = [
+                {
+                    "type": e.type,
+                    "title": e.title,
+                    "outline": e.outline,
+                    "used_thoughts_json": [t.model_dump() for t in e.used_thoughts],
+                    "reason": e.reason,
+                    "pair_id": e.pair_id
+                }
+                for e in essays
+            ]
+
+            response = await self.client.table("essays")\
+                .insert(essays_dict)\
+                .execute()
+
+            inserted = response.data
+            logger.info(f"Batch inserted {len(inserted)} essays")
+            return inserted
+
+        except Exception as e:
+            logger.error(f"Failed to batch insert essays: {e}")
+            raise
+
+    async def get_essays(
+        self,
+        limit: int = 10,
+        offset: int = 0
+    ) -> List[dict]:
+        """
+        essays 테이블 조회 (최신순).
+
+        Args:
+            limit: 최대 반환 개수 (기본 10)
+            offset: 건너뛸 개수 (페이지네이션)
+
+        Returns:
+            에세이 리스트 (JSONB 필드 자동 파싱됨)
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await self.client.table("essays")\
+                .select("*")\
+                .order("generated_at", desc=True)\
+                .limit(limit)\
+                .offset(offset)\
+                .execute()
+
+            essays = response.data
+            logger.info(f"Retrieved {len(essays)} essays")
+            return essays
+
+        except Exception as e:
+            logger.error(f"Failed to get essays: {e}")
+            raise
+
+    async def get_essay_by_id(self, essay_id: int) -> dict:
+        """
+        단일 에세이 조회.
+
+        Args:
+            essay_id: 에세이 ID
+
+        Returns:
+            에세이 데이터
+
+        Raises:
+            Exception: 에세이가 없거나 조회 실패 시
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await self.client.table("essays")\
+                .select("*")\
+                .eq("id", essay_id)\
+                .single()\
+                .execute()
+
+            essay = response.data
+            logger.info(f"Retrieved essay ID {essay_id}")
+            return essay
+
+        except Exception as e:
+            logger.error(f"Failed to get essay {essay_id}: {e}")
+            raise
+
 
 # 싱글톤 인스턴스
 _supabase_service: Optional[SupabaseService] = None
