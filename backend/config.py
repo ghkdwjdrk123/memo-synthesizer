@@ -7,7 +7,7 @@ Loads configuration from environment variables with validation.
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,9 +23,13 @@ class Settings(BaseSettings):
         ...,
         description="Notion API integration token"
     )
-    notion_database_id: str = Field(
-        ...,
-        description="Notion database ID for memo storage"
+    notion_database_id: Optional[str] = Field(
+        default=None,
+        description="Notion database ID for memo storage (optional if parent_page_id is set)"
+    )
+    notion_parent_page_id: Optional[str] = Field(
+        default=None,
+        description="Notion parent page ID for fetching child pages (optional if database_id is set)"
     )
 
     # Supabase Configuration
@@ -48,6 +52,16 @@ class Settings(BaseSettings):
         description="Anthropic API key for Claude models"
     )
 
+    # Rate Limiting
+    rate_limit_notion: int = Field(default=3, gt=0, description="Notion API rate limit (req/sec)")
+    rate_limit_openai: int = Field(default=10, gt=0, description="OpenAI API rate limit (req/sec)")
+    rate_limit_anthropic: int = Field(default=5, gt=0, description="Anthropic API rate limit (req/sec)")
+
+    # Retry Configuration
+    max_retries: int = Field(default=3, ge=0, description="Maximum retry attempts for API calls")
+    retry_base_delay: float = Field(default=1.0, gt=0, description="Base delay for exponential backoff (seconds)")
+    retry_max_delay: float = Field(default=60.0, gt=0, description="Maximum delay for exponential backoff (seconds)")
+
     # Application Configuration
     environment: str = Field(
         default="development",
@@ -66,12 +80,27 @@ class Settings(BaseSettings):
         description="Comma-separated list of allowed CORS origins"
     )
 
+    # RPC Configuration
+    validate_rpc_on_startup: bool = Field(
+        default=True,
+        description="Validate RPC function availability on startup"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore"
     )
+
+    @model_validator(mode="after")
+    def validate_notion_config(self) -> "Settings":
+        """Validate that either database_id or parent_page_id is provided."""
+        if not self.notion_database_id and not self.notion_parent_page_id:
+            raise ValueError(
+                "Either NOTION_DATABASE_ID or NOTION_PARENT_PAGE_ID must be provided"
+            )
+        return self
 
     @property
     def cors_origins_list(self) -> list[str]:

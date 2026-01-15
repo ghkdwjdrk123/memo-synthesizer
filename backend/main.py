@@ -4,8 +4,18 @@ FastAPI application entry point.
 This module creates and configures the FastAPI application instance.
 """
 
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+    ]
+)
 
 from __init__ import __version__
 from config import settings
@@ -66,9 +76,26 @@ async def startup_event():
     Runs when the application starts.
     Useful for initializing connections, loading resources, etc.
     """
+    logger = logging.getLogger(__name__)
+
+    print("=" * 80)
     print(f"Starting Memo Synthesizer API v{__version__}")
     print(f"Environment: {settings.environment}")
     print(f"CORS Origins: {settings.cors_origins_list}")
+    print("=" * 80)
+
+    # Validate RPC function availability
+    if settings.validate_rpc_on_startup:
+        from services.supabase_service import get_supabase_service
+
+        try:
+            supabase_service = get_supabase_service()
+            await supabase_service.validate_rpc_function_exists()
+        except Exception as e:
+            logger.warning(f"RPC validation failed during startup: {e}")
+            logger.warning("Application will continue using fallback mode")
+
+    print("=" * 80)
 
 
 @app.on_event("shutdown")
