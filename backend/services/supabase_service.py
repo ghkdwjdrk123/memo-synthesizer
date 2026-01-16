@@ -89,18 +89,23 @@ class SupabaseService:
 
     async def get_raw_note_ids(self) -> List[str]:
         """
-        모든 RAW note의 ID 목록 조회 (메모리 절약).
+        모든 활성 RAW note의 ID 목록 조회 (메모리 절약).
 
         Returns:
-            UUID 목록
+            UUID 목록 (삭제된 페이지 제외)
         """
         await self._ensure_initialized()
 
         try:
-            response = await self.client.table("raw_notes").select("id").execute()
+            response = await (
+                self.client.table("raw_notes")
+                .select("id")
+                .eq("is_deleted", False)
+                .execute()
+            )
 
             ids = [row["id"] for row in response.data]
-            logger.info(f"Retrieved {len(ids)} raw note IDs")
+            logger.info(f"Retrieved {len(ids)} active raw note IDs")
             return ids
 
         except Exception as e:
@@ -109,13 +114,13 @@ class SupabaseService:
 
     async def get_raw_notes_by_ids(self, note_ids: List[str]) -> List[dict]:
         """
-        ID 목록으로 RAW notes 조회 (배치별 full content 로드).
+        ID 목록으로 활성 RAW notes 조회 (배치별 full content 로드).
 
         Args:
             note_ids: UUID 목록
 
         Returns:
-            RAW note 데이터 목록
+            RAW note 데이터 목록 (삭제된 페이지 제외)
         """
         await self._ensure_initialized()
 
@@ -124,10 +129,11 @@ class SupabaseService:
                 self.client.table("raw_notes")
                 .select("*")
                 .in_("id", note_ids)
+                .eq("is_deleted", False)
                 .execute()
             )
 
-            logger.info(f"Retrieved {len(response.data)} raw notes by IDs")
+            logger.info(f"Retrieved {len(response.data)} active raw notes by IDs")
             return response.data
 
         except Exception as e:
@@ -135,18 +141,19 @@ class SupabaseService:
             raise
 
     async def get_raw_note_count(self) -> int:
-        """RAW notes 총 개수 조회."""
+        """활성 RAW notes 총 개수 조회 (삭제된 페이지 제외)."""
         await self._ensure_initialized()
 
         try:
             response = await (
                 self.client.table("raw_notes")
                 .select("id", count="exact")
+                .eq("is_deleted", False)
                 .execute()
             )
 
             count = response.count if response.count else 0
-            logger.info(f"Total raw notes: {count}")
+            logger.info(f"Total active raw notes: {count}")
             return count
 
         except Exception as e:
@@ -872,7 +879,7 @@ class SupabaseService:
     async def get_pages_to_fetch(
         self,
         notion_pages: List[Dict[str, Any]]
-    ) -> tuple[List[str], List[str]]:
+    ) -> tuple[List[str], List[str], List[str]]:
         """
         Compare Notion pages with DB using server-side RPC.
 
@@ -884,7 +891,7 @@ class SupabaseService:
                 Each page must have: id, last_edited_time
 
         Returns:
-            Tuple of (new_page_ids, updated_page_ids)
+            Tuple of (new_page_ids, updated_page_ids, deleted_page_ids)
 
         Performance:
             - RPC mode: ~150ms (constant time, scales to 100k pages)
@@ -893,8 +900,8 @@ class SupabaseService:
 
         Example:
             >>> pages = [{"id": "abc", "last_edited_time": "2024-01-15T14:30:00.000Z"}]
-            >>> new, updated = await service.get_pages_to_fetch(pages)
-            >>> print(f"New: {len(new)}, Updated: {len(updated)}")
+            >>> new, updated, deleted = await service.get_pages_to_fetch(pages)
+            >>> print(f"New: {len(new)}, Updated: {len(updated)}, Deleted: {len(deleted)}")
         """
         await self._ensure_initialized()
 
@@ -960,12 +967,15 @@ class SupabaseService:
             # Extract results
             new_page_ids = result.get('new_page_ids', [])
             updated_page_ids = result.get('updated_page_ids', [])
+            deleted_page_ids = result.get('deleted_page_ids', [])
 
             # Validate types
             if not isinstance(new_page_ids, list):
                 raise ValueError(f"Invalid type for new_page_ids: {type(new_page_ids)}")
             if not isinstance(updated_page_ids, list):
                 raise ValueError(f"Invalid type for updated_page_ids: {type(updated_page_ids)}")
+            if not isinstance(deleted_page_ids, list):
+                raise ValueError(f"Invalid type for deleted_page_ids: {type(deleted_page_ids)}")
 
             # Add force_new pages
             new_page_ids.extend(force_new_ids)
@@ -974,17 +984,18 @@ class SupabaseService:
             import re
             UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 
-            for page_id in new_page_ids + updated_page_ids:
+            for page_id in new_page_ids + updated_page_ids + deleted_page_ids:
                 if not UUID_PATTERN.match(page_id):
                     raise ValueError(f"Invalid UUID format: {page_id}")
 
             logger.info(
                 f"✅ RPC change detection completed in {elapsed:.2f}s: "
                 f"{len(new_page_ids)} new, {len(updated_page_ids)} updated, "
+                f"{len(deleted_page_ids)} deleted, "
                 f"{result.get('unchanged_count', len(pages_json) - len(new_page_ids) - len(updated_page_ids))} unchanged"
             )
 
-            return new_page_ids, updated_page_ids
+            return new_page_ids, updated_page_ids, deleted_page_ids
 
         except Exception as rpc_error:
             logger.error(f"❌ RPC change detection failed: {rpc_error}, falling back to full table scan")
@@ -1037,19 +1048,27 @@ class SupabaseService:
                 # Add force_new pages
                 new_ids.extend(force_new_ids)
 
+                # Detect deleted pages (in DB but not in Notion)
+                all_notion_ids = set(page_map.keys())
+                deleted_ids = [
+                    db_id for db_id in existing_map.keys()
+                    if db_id not in all_notion_ids
+                ]
+
                 logger.info(
                     f"✅ Fallback completed: {len(new_ids)} new, {len(updated_ids)} updated, "
+                    f"{len(deleted_ids)} deleted, "
                     f"{len(page_map) - len(new_ids) - len(updated_ids)} unchanged"
                 )
 
-                return new_ids, updated_ids
+                return new_ids, updated_ids, deleted_ids
 
             except Exception as fallback_error:
                 logger.error(f"❌ Fallback also failed: {fallback_error}, treating all as new (last resort)")
 
                 # Last resort: treat all as new
                 all_ids = [p["id"] for p in pages_json] + force_new_ids
-                return all_ids, []
+                return all_ids, [], []
 
     async def validate_rpc_function_exists(self) -> bool:
         """
@@ -1059,6 +1078,8 @@ class SupabaseService:
             bool: True if function exists and works, False otherwise
         """
         try:
+            await self._ensure_initialized()
+
             # Test with empty array
             response = await self.client.rpc('get_changed_pages', {
                 'pages_data': []
@@ -1076,6 +1097,32 @@ class SupabaseService:
             logger.warning(f"⚠️  RPC function 'get_changed_pages' not available: {e}")
             logger.warning("   Import will use fallback mode (full table scan)")
             return False
+
+    async def soft_delete_raw_note(self, notion_page_id: str) -> None:
+        """
+        Mark a page as deleted without removing from DB (soft delete).
+
+        This preserves the page and all downstream data (thought_units, essays)
+        while marking it as deleted in Notion.
+
+        Args:
+            notion_page_id: Notion page ID to soft delete
+
+        Raises:
+            No exceptions - failures are logged only
+        """
+        await self._ensure_initialized()
+
+        try:
+            await self.client.table("raw_notes").update({
+                "is_deleted": True,
+                "deleted_at": datetime.now(timezone.utc).isoformat()
+            }).eq("notion_page_id", notion_page_id).execute()
+
+            logger.warning(f"🗑️  Soft deleted page: {notion_page_id} (essays preserved)")
+
+        except Exception as e:
+            logger.error(f"Failed to soft delete page {notion_page_id}: {e}")
 
     async def increment_job_progress(
         self,

@@ -2,7 +2,6 @@
 Notion API integration service.
 """
 
-import asyncio
 import logging
 from typing import List, Dict, Any
 from notion_client import Client
@@ -414,9 +413,8 @@ class NotionService:
                     # Rate limiting 적용
                     await self.rate_limiter.acquire()
 
-                    # blocks.children.list() API 호출 (asyncio.to_thread로 래핑)
-                    response = await asyncio.to_thread(
-                        self.client.blocks.children.list,
+                    # blocks.children.list() API 호출
+                    response = self.client.blocks.children.list(
                         block_id=parent_page_id,
                         page_size=page_size,
                         **({"start_cursor": start_cursor} if start_cursor else {})
@@ -449,28 +447,26 @@ class NotionService:
 
             blocks = response.get("results", [])
 
-            # child_page 타입의 블록만 변환 (pages.retrieve() 생략)
+            # child_page 타입의 블록만 필터링
+            child_pages = []
             for block in blocks:
                 if block.get("type") == "child_page":
+                    # Child page는 상세 정보가 없으므로 pages.retrieve() 호출 필요
                     child_page_id = block.get("id")
-                    child_page_title = block.get("child_page", {}).get("title", "Untitled")
 
-                    # 최소한의 페이지 정보 구성
-                    page_data = {
-                        "id": child_page_id,
-                        "url": f"https://notion.so/{child_page_id.replace('-', '')}",
-                        "created_time": block.get("created_time"),
-                        "last_edited_time": block.get("last_edited_time"),
-                        "properties": {
-                            "제목": child_page_title
-                        }
-                    }
-                    all_child_pages.append(page_data)
+                    try:
+                        await self.rate_limiter.acquire()
+                        page_data = self.client.pages.retrieve(page_id=child_page_id)
+                        child_pages.append(page_data)
+                    except Exception as e:
+                        logger.warning(f"Failed to retrieve child page {child_page_id}: {e}")
+                        continue
 
-            # 현재 배치에서 추가된 child page 수 계산
-            current_batch_count = len([b for b in blocks if b.get("type") == "child_page"])
+            all_child_pages.extend(child_pages)
+            batch_count += 1
+
             logger.info(
-                f"Batch {batch_count}: Fetched {current_batch_count} child pages "
+                f"Batch {batch_count}: Fetched {len(child_pages)} child pages "
                 f"(Total: {len(all_child_pages)})"
             )
 

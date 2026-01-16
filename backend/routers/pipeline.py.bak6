@@ -4,18 +4,19 @@ Pipeline 라우터.
 RAW → NORMALIZED → ZK → Essay 전체 파이프라인 엔드포인트.
 """
 
-import asyncio
+import gc
 import logging
+import re
 from datetime import datetime
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from config import settings
 from schemas.raw import ImportResult, RawNoteCreate
 from schemas.normalized import ThoughtUnitCreate
 from schemas.zk import ThoughtPairCandidate, ThoughtPairCreate, PairScore
 from schemas.essay import EssayCreate
-from schemas.job import ImportJobCreate, ImportJobStartResponse, ImportJobStatus, ImportJobUpdate, FailedPage
 from services.notion_service import NotionService
 from services.ai_service import AIService, get_ai_service
 from services.supabase_service import SupabaseService, get_supabase_service
@@ -25,182 +26,161 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
 
-# ============================================================
-# Helper Functions for Background Import
-# ============================================================
-
-async def _fetch_page_with_retry(
-    notion_service: NotionService,
-    page_id: str,
-    max_retries: int = 3
-) -> str:
-    """
-    Fetch page content with exponential backoff retry.
-
-    Args:
-        notion_service: Notion service instance
-        page_id: Notion page ID
-        max_retries: Maximum number of retry attempts
-
-    Returns:
-        str: Page content (empty string on total failure)
-    """
-    for attempt in range(max_retries):
-        try:
-            return await notion_service.fetch_page_blocks(page_id)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                # Last attempt failed, propagate error
-                raise
-
-            wait_time = 2 ** attempt  # 1s, 2s, 4s
-            logger.warning(
-                f"Retry {attempt+1}/{max_retries} for page {page_id}: {e}. "
-                f"Waiting {wait_time}s..."
-            )
-            await asyncio.sleep(wait_time)
-
-    return ""  # Should never reach here
-
-
-async def _background_import_task(
-    job_id: str,
-    mode: str,
-    page_size: int,
-    notion_service: NotionService,
-    supabase_service: SupabaseService
+@router.post("/import-from-notion", response_model=ImportResult)
+async def import_from_notion(
+    fetch_all: bool = Query(
+        default=True,
+        description="True: 모든 페이지 가져오기, False: 첫 100개만"
+    ),
+    supabase_service: SupabaseService = Depends(get_supabase_service),
 ):
     """
-    Background task for Notion import with content fetching.
-
-    This RESTORES the commented-out content fetching loop (lines 85-101)
-    but runs it in the background to avoid client timeout.
+    Step 1: Notion DB에서 메모를 가져와 RAW 테이블에 저장.
 
     Args:
-        job_id: UUID of import job
-        mode: Import mode ('database' or 'parent_page')
-        page_size: Batch size for pagination
-        notion_service: Notion service instance
-        supabase_service: Supabase service instance
+        fetch_all: True면 모든 페이지 가져오기 (페이지네이션), False면 첫 100개만
+        supabase_service: Supabase 서비스 (DI)
+
+    Returns:
+        ImportResult: import 성공/실패 결과
+
+    Process:
+        1. NotionService.fetch_all_database_pages() 또는 query_database() 호출
+        2. 각 페이지의 제목, properties 추출
+        3. RAW 테이블에 upsert (notion_page_id 기준 중복 방지)
     """
-    logger.info(f"[Job {job_id}] Starting background import (mode: {mode})")
+    print("IMPORT ENDPOINT CALLED - BEFORE ANY LOGIC", flush=True)
+    print("AFTER PRINT, BEFORE FIRST LOGGER", flush=True)
+    logger.info("=" * 60)
+    logger.info("IMPORT FROM NOTION - START")
+    logger.info(f"Parameters: fetch_all={fetch_all}")
+    print("AFTER FIRST LOGGER.INFO CALLS", flush=True)
+    logger.info("=" * 60)
+
+    result = ImportResult(success=False)
 
     try:
-        # Mark job as processing
-        await supabase_service.update_import_job(
-            job_id,
-            ImportJobUpdate(status="processing", started_at=datetime.utcnow())
-        )
+        # Notion 서비스 초기화
+        logger.info("Initializing Notion service...")
+        print(f"NOTION SERVICE CREATED: {type(notion_service)}", flush=True)
+        notion_service = NotionService()
 
-        # Fetch pages based on mode
-        from config import settings
-        pages = []
+        # Auto-detection: database_id vs parent_page_id
+        if settings.notion_database_id:
+            # Database 모드 (기존 방식)
+            logger.info(f"Using database mode: {settings.notion_database_id}")
+            logger.info(f"Starting Notion import (fetch_all={fetch_all})...")
 
-        if mode == "database":
-            query_result = await notion_service.query_database(page_size=page_size)
-            if not query_result.get("success"):
-                raise Exception(f"Notion query failed: {query_result.get('error')}")
-            pages = query_result.get("pages", [])
-        elif mode == "parent_page":
+            if fetch_all:
+                # 모든 페이지 가져오기 (페이지네이션)
+                pages = await notion_service.fetch_all_database_pages(page_size=100)
+            else:
+                # 하위 호환: 첫 100개만 (테스트용)
+                query_result = await notion_service.query_database(page_size=100)
+                if not query_result.get("success"):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Notion query failed: {query_result.get('error')}",
+                    )
+                pages = query_result.get("pages", [])
+
+        elif settings.notion_parent_page_id:
+            # Parent Page 모드 (신규 방식)
+            logger.info(f"Using parent page mode: {settings.notion_parent_page_id}")
+
             pages = await notion_service.fetch_child_pages_from_parent(
                 parent_page_id=settings.notion_parent_page_id,
                 page_size=100
             )
 
-        total_count = len(pages)
-        logger.info(f"[Job {job_id}] Retrieved {total_count} pages")
-
-        await supabase_service.update_import_job(
-            job_id,
-            ImportJobUpdate(total_pages=total_count)
-        )
-
-        # Incremental update: Detect changes
-        new_page_ids, updated_page_ids, deleted_page_ids = await supabase_service.get_pages_to_fetch(pages)
-        fetch_targets = set(new_page_ids + updated_page_ids)
-
-        logger.info(
-            f"[Job {job_id}] Incremental import: "
-            f"{len(new_page_ids)} new, {len(updated_page_ids)} updated, "
-            f"{len(deleted_page_ids)} deleted, "
-            f"{len(pages) - len(fetch_targets)} unchanged (will skip)"
-        )
-
-        # Handle deleted pages (soft delete)
-        if deleted_page_ids:
-            logger.warning(
-                f"[Job {job_id}] Found {len(deleted_page_ids)} pages deleted in Notion. "
-                f"Marking as deleted (essays will be preserved)..."
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Either NOTION_DATABASE_ID or NOTION_PARENT_PAGE_ID must be configured"
             )
-            for deleted_id in deleted_page_ids:
-                try:
-                    await supabase_service.soft_delete_raw_note(deleted_id)
-                except Exception as e:
-                    logger.error(f"[Job {job_id}] Failed to soft delete {deleted_id}: {e}")
 
-        # Process each page with INCREMENTAL content fetching
-        for idx, page in enumerate(pages, 1):
+        total_count = len(pages)
+        logger.info(f"Fetched {total_count} pages from Notion")
+
+        # 중복 제거 (같은 세션 내)
+        unique_pages = {}
+        for page in pages:
             page_id = page.get("id")
+            if page_id not in unique_pages:
+                unique_pages[page_id] = page
 
+        pages = list(unique_pages.values())
+        logger.info(f"After deduplication: {len(pages)} unique pages")
+
+        # 각 페이지를 RAW 테이블에 저장
+        imported_count = 0
+        skipped_count = 0
+        MAX_CONTENT_SIZE = 500_000  # 500KB (Issue #10)
+
+        logger.info(f"Starting to process {len(pages)} pages...")
+
+        for idx, page in enumerate(pages, 1):
             try:
-                # Skip unchanged pages
-                if page_id not in fetch_targets:
-                    logger.info(f"[Job {job_id}] [{idx}/{total_count}] ⏭️  Skipped (unchanged): {page_id}")
-                    await supabase_service.increment_job_progress(job_id, skipped=True)
+                # Notion 페이지 데이터 추출
+                page_id = page.get("id", "")
+
+                logger.info(f"[{idx}/{len(pages)}] Processing page: {page_id}")
+
+                # Page ID 검증 (Issue #3) - 빈 값만 거부, 테스트용 ID는 허용
+                if not page_id or not isinstance(page_id, str) or len(page_id) < 8:
+                    logger.warning(f"[{idx}/{len(pages)}] Invalid or missing page_id: {page_id}, skipping")
+                    skipped_count += 1
                     continue
 
-                # Fetch block content (only for new/updated pages)
-                fetched_content = None
-                if mode == "parent_page":
-                    try:
-                        fetched_content = await _fetch_page_with_retry(notion_service, page_id, max_retries=3)
-                        if "properties" not in page:
-                            page["properties"] = {}
-
-                        # If content is empty, use title as fallback
-                        if not fetched_content or not fetched_content.strip():
-                            # Extract title from properties
-                            properties = page.get("properties", {})
-                            title_value = None
-                            for key in ["제목", "Name", "이름", "title"]:
-                                if key in properties and properties[key]:
-                                    title_value = properties[key]
-                                    break
-
-                            if title_value and isinstance(title_value, str):
-                                fetched_content = title_value
-                                page["properties"]["본문"] = title_value
-                                logger.info(f"[Job {job_id}] [{idx}/{total_count}] ℹ Empty content, using title as fallback")
-                            else:
-                                fetched_content = ""
-                                page["properties"]["본문"] = ""
-                                logger.warning(f"[Job {job_id}] [{idx}/{total_count}] ⚠ No content and no title available")
-                        else:
-                            page["properties"]["본문"] = fetched_content
-                            logger.info(f"[Job {job_id}] [{idx}/{total_count}] ✓ Fetched {len(fetched_content)} chars")
-                    except Exception as e:
-                        logger.warning(f"[Job {job_id}] [{idx}/{total_count}] ✗ Failed to fetch content: {e}")
-                        fetched_content = ""
-                        if "properties" not in page:
-                            page["properties"] = {}
-                        page["properties"]["본문"] = ""
-
-                # Extract and upsert (same as original)
                 properties = page.get("properties", {})
+
+                # 제목 추출 (properties에서 "제목" 또는 "Name" 필드 찾기)
                 title = None
                 for key in ["제목", "Name", "이름", "title"]:
                     if key in properties and properties[key]:
                         title = properties[key]
                         break
 
-                notion_url = page.get("url") or f"https://notion.so/{page_id.replace('-', '')}"
+                # 블록 콘텐츠 가져오기
+                content = None
+                try:
+                    logger.info(f"[{idx}/{len(pages)}] Fetching blocks for page {page_id}...")
+                    content = await notion_service.fetch_page_blocks(page_id)
+                    logger.info(f"[{idx}/{len(pages)}] Fetched {len(content) if content else 0} characters of content")
 
-                # Use fetched_content directly instead of extracting from properties
+                    # Content 검증 및 정리
+                    if content:
+                        content = content.strip()
+
+                        # 최소 길이 체크
+                        if len(content) < 10:
+                            logger.debug(f"Page {page_id}: No meaningful content (< 10 chars)")
+                            content = None
+                        # 최대 길이 체크 (Issue #10)
+                        elif len(content) > MAX_CONTENT_SIZE:
+                            logger.warning(
+                                f"Page {page_id}: Content exceeds {MAX_CONTENT_SIZE} chars, truncating"
+                            )
+                            content = content[:MAX_CONTENT_SIZE]
+                    else:
+                        content = None
+
+                except Exception as e:
+                    logger.warning(f"Failed to fetch blocks for page {page_id}: {e}")
+                    content = None  # 블록 가져오기 실패해도 페이지는 저장
+
+                # URL 생성 (Issue #3 개선)
+                if page.get("url"):
+                    notion_url = page["url"]
+                else:
+                    notion_url = f"https://notion.so/{page_id.replace('-', '')}"
+
+                # RawNoteCreate 객체 생성
                 raw_note = RawNoteCreate(
                     notion_page_id=page_id,
                     notion_url=notion_url,
                     title=title if title and isinstance(title, str) else None,
-                    content=fetched_content,
+                    content=content,
                     properties_json=properties,
                     notion_created_time=datetime.fromisoformat(
                         page.get("created_time").replace("Z", "+00:00")
@@ -210,203 +190,40 @@ async def _background_import_task(
                     ),
                 )
 
+                # Supabase에 upsert
+                logger.info(f"[{idx}/{len(pages)}] Saving to database...")
                 await supabase_service.upsert_raw_note(raw_note)
-                await supabase_service.increment_job_progress(job_id, imported=True)
+                imported_count += 1
+                logger.info(f"[{idx}/{len(pages)}] ✓ Successfully imported (Total: {imported_count})")
 
             except Exception as e:
-                logger.warning(f"[Job {job_id}] [{idx}/{total_count}] Failed: {str(e)}")
-                await supabase_service.increment_job_progress(
-                    job_id,
-                    failed_page={"page_id": page_id, "error_message": str(e)[:500]}
-                )
+                logger.warning(f"[{idx}/{len(pages)}] ✗ Failed to import page {page.get('id')}: {e}")
+                skipped_count += 1
+                result.errors.append(f"Page {page.get('id')}: {str(e)}")
 
-        # Calculate success rate and mark completed
-        # Note: skipped 페이지도 성공으로 간주 (중복 방지는 의도된 동작)
-        job = await supabase_service.get_import_job(job_id)
-        total = job["total_pages"]
-        imported = job["imported_pages"]
-        skipped = job["skipped_pages"]
-        success_count = imported + skipped  # 중복 방지(skip)도 성공
-        success_rate = (success_count / total * 100) if total > 0 else 0
+        # 결과 반환
+        result.success = True
+        result.imported_count = imported_count
+        result.skipped_count = skipped_count
 
-        if success_rate >= 90:
-            status = "completed"
-            message = f"Import completed: {imported} imported, {skipped} skipped (success rate: {success_rate:.1f}%)"
-        else:
-            status = "failed"
-            message = f"Import failed: only {success_rate:.1f}% pages processed ({imported} imported, {skipped} skipped)"
-
-        await supabase_service.update_import_job(
-            job_id,
-            ImportJobUpdate(
-                status=status,
-                error_message=message if status == "failed" else None,
-                completed_at=datetime.utcnow()
-            )
-        )
-
-        logger.info(
-            f"[Job {job_id}] ✓ {status.upper()}: {imported}/{total} imported, "
-            f"{skipped} skipped, {len(job.get('failed_pages', []))} failed"
-        )
-
-    except Exception as e:
-        logger.error(f"[Job {job_id}] ✗ Critical failure: {str(e)}", exc_info=True)
-        try:
-            await supabase_service.update_import_job(
-                job_id,
-                ImportJobUpdate(
-                    status="failed",
-                    error_message=str(e)[:1000],
-                    completed_at=datetime.utcnow()
-                )
-            )
-        except Exception as update_error:
-            logger.error(f"[Job {job_id}] Failed to update job status: {update_error}")
-
-
-@router.post("/import-from-notion", response_model=ImportJobStartResponse)
-async def import_from_notion(
-    page_size: int = Query(default=100, ge=1, le=100, description="Batch size for pagination"),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    supabase_service: SupabaseService = Depends(get_supabase_service),
-):
-    """
-    Step 1: Start Notion import in background.
-
-    Returns job_id immediately. Use GET /pipeline/import-status/{job_id} to check progress.
-
-    Args:
-        page_size: Batch size for pagination (1-100)
-        background_tasks: FastAPI BackgroundTasks
-        supabase_service: Supabase service (DI)
-
-    Returns:
-        ImportJobStartResponse: Job ID and status
-
-    Process:
-        1. Create import job record with 'pending' status
-        2. Start background task to process import
-        3. Background task:
-           - Fetches child pages from Notion
-           - Fetches content for each page (RESTORED)
-           - Upserts to raw_notes table
-           - Updates job progress in real-time
-    """
-    from config import settings
-
-    try:
-        # Determine mode
-        if settings.notion_database_id:
-            mode = "database"
-        elif settings.notion_parent_page_id:
-            mode = "parent_page"
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Neither NOTION_DATABASE_ID nor NOTION_PARENT_PAGE_ID is configured"
-            )
-
-        # Create job record
-        job_create = ImportJobCreate(
-            mode=mode,
-            config_json={"page_size": page_size, "timestamp": datetime.utcnow().isoformat()}
-        )
-        job = await supabase_service.create_import_job(job_create)
-        job_id = str(job["id"])
-
-        # Start background task
-        notion_service = NotionService()
-        background_tasks.add_task(
-            _background_import_task,
-            job_id=job_id,
-            mode=mode,
-            page_size=page_size,
-            notion_service=notion_service,
-            supabase_service=supabase_service
-        )
-
-        logger.info(f"Import job {job_id} started (mode: {mode})")
-
-        return ImportJobStartResponse(
-            job_id=job_id,
-            status="pending",
-            message=f"Import job started (mode: {mode}). Use GET /pipeline/import-status/{job_id} to check progress."
-        )
+        logger.info("=" * 60)
+        logger.info("IMPORT FROM NOTION - COMPLETED")
+        logger.info(f"✓ Successfully imported: {imported_count} pages")
+        logger.info(f"✗ Skipped: {skipped_count} pages")
+        logger.info(f"Total processed: {imported_count + skipped_count} pages")
+        logger.info("=" * 60)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to start import job: {e}", exc_info=True)
+        logger.error("=" * 60)
+        logger.error("IMPORT FROM NOTION - FAILED")
+        logger.error(f"Error: {e}")
+        logger.error("=" * 60)
+        result.errors.append(str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@router.get("/import-status/{job_id}", response_model=ImportJobStatus)
-async def get_import_status(
-    job_id: str,
-    supabase_service: SupabaseService = Depends(get_supabase_service),
-):
-    """
-    Get import job status and progress.
-
-    Poll this endpoint every 5 seconds until status is 'completed' or 'failed'.
-
-    Args:
-        job_id: UUID of import job
-        supabase_service: Supabase service (DI)
-
-    Returns:
-        ImportJobStatus: Job status with progress information
-
-    Raises:
-        HTTPException: 404 if job not found, 500 on other errors
-    """
-    try:
-        job = await supabase_service.get_import_job(job_id)
-
-        # Calculate progress
-        total = job.get("total_pages", 0)
-        processed = job.get("processed_pages", 0)
-        progress = (processed / total * 100) if total > 0 else 0.0
-
-        # Calculate elapsed time
-        elapsed_seconds = None
-        if job.get("started_at"):
-            from datetime import timezone
-            start = datetime.fromisoformat(str(job["started_at"]).replace("Z", "+00:00"))
-            end = (datetime.fromisoformat(str(job["completed_at"]).replace("Z", "+00:00"))
-                   if job.get("completed_at") else datetime.now(timezone.utc))
-            elapsed_seconds = (end - start).total_seconds()
-
-        # Parse failed pages
-        failed_pages = [
-            FailedPage(page_id=fp["page_id"], error_message=fp["error_message"])
-            for fp in job.get("failed_pages", [])
-        ]
-
-        return ImportJobStatus(
-            job_id=job["id"],
-            status=job["status"],
-            mode=job["mode"],
-            total_pages=job.get("total_pages", 0),
-            processed_pages=job.get("processed_pages", 0),
-            imported_pages=job.get("imported_pages", 0),
-            skipped_pages=job.get("skipped_pages", 0),
-            progress_percentage=round(progress, 1),
-            created_at=job["created_at"],
-            started_at=job.get("started_at"),
-            completed_at=job.get("completed_at"),
-            elapsed_seconds=round(elapsed_seconds, 1) if elapsed_seconds else None,
-            error_message=job.get("error_message"),
-            failed_pages=failed_pages,
-            config_json=job.get("config_json", {})
-        )
-
-    except Exception as e:
-        if "not found" in str(e).lower():
-            raise HTTPException(status_code=404, detail=f"Import job {job_id} not found")
-        logger.error(f"Failed to get import status for {job_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return result
 
 
 @router.post("/extract-thoughts")
@@ -469,9 +286,8 @@ async def extract_thoughts(
                     note_id = note["id"]
                     title = note.get("title", "")
 
-                    # properties_json에서 본문 추출
-                    props = note.get("properties_json", {})
-                    content = props.get("본문", "") or props.get("content", "")
+                    # content 필드에서 본문 추출 (Phase 2에서 블록으로부터 수집됨)
+                    content = note.get("content", "")
 
                     if not content and not title:
                         logger.warning(f"Note {note_id} has no title or content, skipping")
@@ -534,6 +350,9 @@ async def extract_thoughts(
                     result["errors"].append(
                         f"Note {note.get('id')}: {str(e)}"
                     )
+
+            # 배치 처리 완료 후 메모리 정리 (Issue #2)
+            gc.collect()
 
         # 결과 반환
         result["success"] = True
@@ -841,7 +660,10 @@ async def get_pairs(
 
 @router.post("/run-all")
 async def run_all(
-    page_size: int = Query(default=100, ge=1, le=100, description="Step 1용 메모 수"),
+    fetch_all: bool = Query(
+        default=True,
+        description="Step 1용: True면 모든 페이지, False면 첫 100개만"
+    ),
     min_similarity: float = Query(default=0.05, ge=0, le=1, description="Step 3용 최소 유사도 (낮은 값 = 서로 다른 아이디어)"),
     max_similarity: float = Query(default=0.35, ge=0, le=1, description="Step 3용 최대 유사도"),
     min_score: int = Query(default=65, ge=0, le=100, description="Step 3용 최소 창의적 연결 점수 (threshold)"),
@@ -854,7 +676,7 @@ async def run_all(
     전체 파이프라인 (Step 1 → Step 2 → Step 3 → Step 4) 순차 실행.
 
     Args:
-        page_size: Step 1에서 가져올 메모 수 (1-100)
+        fetch_all: Step 1용: True면 모든 페이지 가져오기 (페이지네이션), False면 첫 100개만
         min_similarity: Step 3용 최소 유사도 (0-1, 기본 0.05 = 낮은 유사도)
         max_similarity: Step 3용 최대 유사도 (0-1, 기본 0.35)
         min_score: Step 3용 최소 창의적 연결 점수 (0-100, 기본 65)
@@ -882,7 +704,7 @@ async def run_all(
         logger.info("=== Step 1: Import from Notion ===")
         try:
             step1_result = await import_from_notion(
-                page_size=page_size,
+                fetch_all=fetch_all,
                 supabase_service=supabase_service
             )
             result["step1"] = {

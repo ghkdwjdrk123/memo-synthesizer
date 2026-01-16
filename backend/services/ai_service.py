@@ -13,6 +13,7 @@ from anthropic import Anthropic
 from config import settings
 from schemas.normalized import ThoughtExtractionResult
 from schemas.zk import ThoughtPairCandidate, PairScoringResult
+from services.rate_limiter import RateLimiter, ExponentialBackoff
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +119,19 @@ class AIService:
     """Service for AI operations using OpenAI and Anthropic."""
 
     def __init__(self):
-        """Initialize AI clients."""
+        """Initialize AI clients with rate limiting."""
         self.openai_client = OpenAI(api_key=settings.openai_api_key)
         self.anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
+
+        # Rate limiters
+        self.openai_limiter = RateLimiter(rate=float(settings.rate_limit_openai))
+        self.anthropic_limiter = RateLimiter(rate=float(settings.rate_limit_anthropic))
+
+        # Exponential backoff for retries
+        self.backoff = ExponentialBackoff(
+            base_delay=settings.retry_base_delay,
+            max_delay=settings.retry_max_delay
+        )
 
     async def create_embedding(self, text: str, model: str = "text-embedding-3-small") -> Dict[str, Any]:
         """
@@ -133,27 +144,55 @@ class AIService:
         Returns:
             Dict containing embedding and metadata
         """
-        try:
-            response = self.openai_client.embeddings.create(
-                input=text,
-                model=model
-            )
+        last_error = None
 
-            embedding = response.data[0].embedding
+        for retry in range(settings.max_retries + 1):
+            try:
+                # Rate limiting
+                await self.openai_limiter.acquire()
 
-            return {
-                "success": True,
-                "embedding": embedding,
-                "dimension": len(embedding),
-                "model": model,
-                "tokens_used": response.usage.total_tokens
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "error_type": type(e).__name__
-            }
+                response = self.openai_client.embeddings.create(
+                    input=text,
+                    model=model
+                )
+
+                embedding = response.data[0].embedding
+
+                return {
+                    "success": True,
+                    "embedding": embedding,
+                    "dimension": len(embedding),
+                    "model": model,
+                    "tokens_used": response.usage.total_tokens
+                }
+
+            except Exception as e:
+                last_error = e
+
+                # Check if it's a rate limit error (status code 429)
+                if hasattr(e, 'status_code') and e.status_code == 429:
+                    logger.warning(
+                        f"OpenAI rate limited, retrying ({retry+1}/{settings.max_retries + 1})"
+                    )
+                    if retry < settings.max_retries:
+                        await self.backoff.sleep(retry)
+                        continue
+
+                # For other errors, log and return immediately
+                logger.error(f"OpenAI embedding error: {e}")
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+
+        # All retries exhausted for rate limit errors
+        logger.error(f"OpenAI embedding failed after {settings.max_retries + 1} retries")
+        return {
+            "success": False,
+            "error": str(last_error),
+            "error_type": type(last_error).__name__ if last_error else "Unknown"
+        }
 
     async def generate_content_with_claude(
         self,
@@ -176,35 +215,63 @@ class AIService:
         Returns:
             Dict containing generated content and metadata
         """
-        try:
-            message = self.anthropic_client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system_message,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
+        last_error = None
 
-            content = message.content[0].text
+        for retry in range(settings.max_retries + 1):
+            try:
+                # Rate limiting
+                await self.anthropic_limiter.acquire()
 
-            return {
-                "success": True,
-                "content": content,
-                "model": model,
-                "tokens_used": {
-                    "input": message.usage.input_tokens,
-                    "output": message.usage.output_tokens
-                },
-                "stop_reason": message.stop_reason
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "error_type": type(e).__name__
-            }
+                message = self.anthropic_client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system_message,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+
+                content = message.content[0].text
+
+                return {
+                    "success": True,
+                    "content": content,
+                    "model": model,
+                    "tokens_used": {
+                        "input": message.usage.input_tokens,
+                        "output": message.usage.output_tokens
+                    },
+                    "stop_reason": message.stop_reason
+                }
+
+            except Exception as e:
+                last_error = e
+
+                # Check if it's a rate limit error (status code 429)
+                if hasattr(e, 'status_code') and e.status_code == 429:
+                    logger.warning(
+                        f"Anthropic rate limited, retrying ({retry+1}/{settings.max_retries + 1})"
+                    )
+                    if retry < settings.max_retries:
+                        await self.backoff.sleep(retry)
+                        continue
+
+                # For other errors, log and return immediately
+                logger.error(f"Anthropic API error: {e}")
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+
+        # All retries exhausted for rate limit errors
+        logger.error(f"Anthropic API failed after {settings.max_retries + 1} retries")
+        return {
+            "success": False,
+            "error": str(last_error),
+            "error_type": type(last_error).__name__ if last_error else "Unknown"
+        }
 
     async def extract_thoughts(
         self, title: str, content: str

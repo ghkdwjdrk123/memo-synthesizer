@@ -4,7 +4,7 @@ Integration tests for POST /pipeline/generate-essays endpoint.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 
 # Note: This assumes you have a way to import the FastAPI app
 # Adjust the import based on your actual structure
@@ -68,7 +68,7 @@ class TestGenerateEssaysEndpoint:
             return_value=MagicMock(data=[])
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/pipeline/generate-essays?max_pairs=2")
 
         assert response.status_code == 200
@@ -87,7 +87,7 @@ class TestGenerateEssaysEndpoint:
             return_value=MagicMock(data=[])
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/pipeline/generate-essays")
 
         assert response.status_code == 200
@@ -105,7 +105,7 @@ class TestGenerateEssaysEndpoint:
             return_value=MagicMock(data=sample_unused_pairs[:5])
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/pipeline/generate-essays?max_pairs=3")
 
         # Should only process 3 pairs
@@ -127,7 +127,7 @@ class TestGenerateEssaysEndpoint:
             Exception("API Error")
         ]
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/pipeline/generate-essays?max_pairs=2")
 
         assert response.status_code == 200
@@ -140,13 +140,13 @@ class TestGenerateEssaysEndpoint:
         self, mock_supabase_client, mock_anthropic_client
     ):
         """Invalid max_pairs value is rejected."""
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             # max_pairs must be >= 1 and <= 10
             response = await client.post("/pipeline/generate-essays?max_pairs=0")
 
         assert response.status_code == 422  # Validation error
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/pipeline/generate-essays?max_pairs=11")
 
         assert response.status_code == 422
@@ -185,7 +185,7 @@ class TestGetEssaysEndpoint:
             )
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/pipeline/essays")
 
         assert response.status_code == 200
@@ -202,7 +202,7 @@ class TestGetEssaysEndpoint:
             return_value=MagicMock(data=[])
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/pipeline/essays")
 
         assert response.status_code == 200
@@ -224,7 +224,7 @@ class TestGetEssaysEndpoint:
             )
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/pipeline/essays?limit=2&offset=10")
 
         assert response.status_code == 200
@@ -239,7 +239,7 @@ class TestGetEssaysEndpoint:
             side_effect=Exception("Database error")
         )
 
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/pipeline/essays")
 
         assert response.status_code == 500
