@@ -167,3 +167,105 @@ def sample_saved_essay():
         "pair_id": 1,
         "generated_at": datetime.now().isoformat()
     }
+
+
+# ============================================================
+# 하이브리드 C 전략 Fixtures
+# ============================================================
+
+@pytest.fixture
+def mock_supabase_hybrid():
+    """Mock Supabase client for hybrid strategy tests."""
+    with patch('services.supabase_service.create_async_client') as mock:
+        client = MagicMock()
+
+        # pair_candidates 테이블 mock
+        client.table.return_value.upsert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[{"id": i} for i in range(100)])
+        )
+        client.table.return_value.select.return_value.eq.return_value.lt.return_value.gte.return_value.lte.return_value.order.return_value.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
+
+        # thought_pairs 테이블 mock
+        client.table.return_value.update.return_value.eq.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[{"id": 1}])
+        )
+
+        mock.return_value = AsyncMock(return_value=client)
+        yield client
+
+
+@pytest.fixture
+def mock_ai_service_hybrid():
+    """Mock AI service for hybrid strategy tests."""
+    with patch('services.ai_service.Anthropic') as mock:
+        client = MagicMock()
+
+        # score_pairs 응답 mock
+        client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text='''
+{
+    "pair_scores": [
+        {
+            "thought_a_id": 10,
+            "thought_b_id": 20,
+            "logical_expansion_score": 85,
+            "connection_reason": "두 아이디어는 창의적으로 연결됩니다."
+        }
+    ]
+}
+''')]
+        )
+
+        mock.return_value = client
+        yield client
+
+
+@pytest.fixture
+def sample_candidates():
+    """Sample pair candidates for testing (1000개)."""
+    return [
+        {
+            'id': i,
+            'thought_a_id': i * 2,
+            'thought_b_id': i * 2 + 1,
+            'similarity': 0.05 + (i % 30) * 0.01,  # 0.05 ~ 0.34 범위
+            'raw_note_id_a': f'note-{i % 100}',
+            'raw_note_id_b': f'note-{(i % 100) + 1}'
+        }
+        for i in range(1, 1001)
+    ]
+
+
+@pytest.fixture
+def sample_pending_candidates():
+    """Sample pending candidates with thought claims."""
+    return [
+        {
+            'id': i,
+            'thought_a_id': i * 2,
+            'thought_b_id': i * 2 + 1,
+            'thought_a_claim': f'사고 A {i}: 창의적인 아이디어',
+            'thought_b_claim': f'사고 B {i}: 다른 관점의 통찰',
+            'similarity': 0.2,
+            'raw_note_id_a': f'note-{i}',
+            'raw_note_id_b': f'note-{i+1}'
+        }
+        for i in range(1, 51)
+    ]
+
+
+@pytest.fixture
+def sample_scored_pairs():
+    """Sample scored pairs from Claude evaluation."""
+    from schemas.zk import PairScore
+    return [
+        PairScore(
+            thought_a_id=i * 2,
+            thought_b_id=i * 2 + 1,
+            logical_expansion_score=50 + i * 5,  # 55 ~ 95 범위
+            connection_reason=f'연결 이유 {i}: 두 사고는 상호보완적입니다.'
+        )
+        for i in range(1, 11)
+    ]
