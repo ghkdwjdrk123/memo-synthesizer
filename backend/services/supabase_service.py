@@ -5,6 +5,7 @@ PostgreSQL + pgvector를 사용한 데이터 CRUD.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from uuid import UUID
@@ -952,13 +953,12 @@ class SupabaseService:
 
         if not pages_json and not force_new_ids:
             logger.warning("No valid pages to check")
-            return [], []
+            return [], [], []
 
         logger.info(f"Change detection: checking {len(pages_json)} pages via RPC (sample: {[p['id'] for p in pages_json[:3]]})")
 
         # Try RPC change detection (Solution 3)
         try:
-            import time
             start_time = time.time()
 
             response = await self.client.rpc('get_changed_pages', {
@@ -1578,6 +1578,374 @@ class SupabaseService:
                 f"Failed to move candidates to thought_pairs "
                 f"({len(candidate_ids)} candidates): {e}"
             )
+            raise
+
+    # ============================================================
+    # Distribution Cache (상대적 임계값 전략)
+    # ============================================================
+
+    async def get_similarity_distribution_cache(self) -> Optional[Dict[str, Any]]:
+        """
+        유사도 분포 캐시 조회.
+
+        Returns:
+            {
+                "thought_count": 1921,
+                "total_pairs": 38420,
+                "percentiles": {"p0": 0.26, "p10": 0.30, ...},
+                "mean": 0.38,
+                "stddev": 0.05,
+                "calculated_at": "2026-01-26T10:00:00",
+                "duration_ms": 5432
+            }
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await (
+                self.client.table("similarity_distribution_cache")
+                .select("*")
+                .eq("id", 1)
+                .maybe_single()
+                .execute()
+            )
+
+            if not response.data:
+                return None
+
+            data = response.data
+
+            # 백분위수를 딕셔너리로 변환
+            percentiles = {
+                "p0": data["p0"],
+                "p10": data["p10"],
+                "p20": data["p20"],
+                "p30": data["p30"],
+                "p40": data["p40"],
+                "p50": data["p50"],
+                "p60": data["p60"],
+                "p70": data["p70"],
+                "p80": data["p80"],
+                "p90": data["p90"],
+                "p100": data["p100"],
+            }
+
+            return {
+                "thought_count": data["thought_unit_count"],
+                "total_pairs": data["total_pair_count"],
+                "percentiles": percentiles,
+                "mean": data["mean"],
+                "stddev": data["stddev"],
+                "calculated_at": data["calculated_at"],
+                "duration_ms": data.get("calculation_duration_ms"),
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get distribution cache: {e}")
+            raise
+
+    async def calculate_similarity_distribution(self) -> Dict[str, Any]:
+        """
+        유사도 분포 계산 RPC 호출.
+
+        NOTE: 이 메서드는 DEPRECATED. Distance Table에서 직접 계산하는
+        calculate_distribution_from_distance_table()을 사용하세요.
+
+        Returns:
+            {
+                "success": true,
+                "thought_count": 1921,
+                "total_pairs": 38420,
+                "percentiles": {"p0": 0.26, ...},
+                "mean": 0.38,
+                "stddev": 0.05,
+                "duration_ms": 5432
+            }
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await self.client.rpc(
+                "calculate_similarity_distribution"
+            ).execute()
+
+            if not response.data:
+                raise Exception("RPC returned no data")
+
+            result = response.data
+
+            logger.info(
+                f"Distribution calculated: {result.get('thought_count')} thoughts, "
+                f"{result.get('total_pairs')} pairs, "
+                f"{result.get('duration_ms')}ms"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to calculate distribution: {e}")
+            raise
+
+    async def calculate_distribution_from_distance_table(self) -> Dict[str, Any]:
+        """
+        Distance Table 기반 유사도 분포 계산 (빠름).
+
+        기존 calculate_similarity_distribution: thought_units CROSS JOIN → 60초+ 타임아웃
+        신규: thought_pair_distances 집계 → 1초 미만
+
+        Returns:
+            {
+                "success": true,
+                "total_pairs": 1821186,
+                "percentiles": {
+                    "total_pairs": 1821186,
+                    "p0": 0.001, "p10": 0.057, ..., "p100": 0.987,
+                    "mean": 0.342, "stddev": 0.15
+                },
+                "duration_ms": 850,
+                "cached": true
+            }
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await self.client.rpc(
+                "calculate_distribution_from_distance_table"
+            ).execute()
+
+            if not response.data:
+                raise Exception("RPC returned no data")
+
+            result = response.data
+
+            if not result.get("success"):
+                raise Exception(result.get("error", "Unknown error"))
+
+            logger.info(
+                f"Distribution calculated from Distance Table: "
+                f"{result.get('total_pairs'):,} pairs, "
+                f"{result.get('duration_ms')}ms"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to calculate distribution from distance table: {e}")
+            raise
+
+    async def count_thought_units(self) -> int:
+        """
+        임베딩이 있는 thought_units 개수 조회.
+
+        Returns:
+            thought_units 개수
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await (
+                self.client.table("thought_units")
+                .select("id", count="exact")
+                .not_.is_("embedding", "null")
+                .execute()
+            )
+
+            count = response.count if response.count is not None else 0
+
+            logger.debug(f"Thought units count: {count}")
+
+            return count
+
+        except Exception as e:
+            logger.error(f"Failed to count thought units: {e}")
+            raise
+
+    # ============================================================
+    # Distance Table 조회 (Phase 2: Distance Table Service)
+    # ============================================================
+
+    async def get_candidates_from_distance_table(
+        self,
+        min_similarity: float,
+        max_similarity: float
+    ) -> List[dict]:
+        """
+        Distance Table에서 유사도 범위 내 후보 조회 (초고속).
+
+        Performance: <0.1초 (vs v4 60초+)
+
+        Security: 80% 범위 검증으로 비정상 요청 차단
+        - Normal: p10_p40 (30% 범위) → ~48,000개 수집
+        - Blocked: p0_p100 (100% 범위) → ValueError 발생
+
+        구현 전략:
+        0. 범위 검증 (80% 임계값)
+        1. thought_pair_distances에서 유사도 범위 조회 (인덱스 활용, ~0.05초, 무제한)
+        2. thought_units에서 claim, raw_note_id JOIN (~0.05초)
+        3. 결과 조합 (Python 메모리 연산)
+
+        Args:
+            min_similarity: 최소 유사도 [0, 1] (예: 0.057)
+            max_similarity: 최대 유사도 [0, 1] (예: 0.093)
+
+        Returns:
+            List[dict]: [
+                {
+                    "thought_a_id": int,
+                    "thought_b_id": int,
+                    "thought_a_claim": str,
+                    "thought_b_claim": str,
+                    "similarity": float,
+                    "raw_note_id_a": str,
+                    "raw_note_id_b": str
+                }
+            ]
+
+        Raises:
+            ValueError: 범위가 80%를 초과하는 경우
+            Exception: DB 조회 실패 시
+        """
+        await self._ensure_initialized()
+
+        # Step 0: 범위 검증 (80% 임계값)
+        similarity_range = max_similarity - min_similarity
+        if similarity_range > 0.8:
+            error_msg = (
+                f"Similarity range too wide: {similarity_range:.1%} > 80%. "
+                f"Range [{min_similarity:.3f}, {max_similarity:.3f}] is likely an error. "
+                f"Normal strategies use 30-40% range (e.g., p10_p40, p30_p60)."
+            )
+            logger.error(f"Range validation failed: {error_msg}")
+            raise ValueError(error_msg)
+
+        logger.info(
+            f"Querying distance table: "
+            f"range=[{min_similarity:.3f}, {max_similarity:.3f}] "
+            f"({similarity_range:.1%}), no limit"
+        )
+
+        try:
+            start_time = time.time()
+
+            # Step 1: 유사도 범위 조회 (페이징 처리)
+            # Supabase REST API는 기본적으로 1,000개만 반환하므로 페이징 필요
+            # 안전 상한선: 100,000개 (80% 범위 검증으로 대부분 차단됨)
+            pairs = []
+            page_size = 1000  # Supabase 기본 limit
+            max_total = 100000  # 안전 상한선
+            offset = 0
+
+            while len(pairs) < max_total:
+                page_response = await (
+                    self.client.table("thought_pair_distances")
+                    .select("thought_a_id, thought_b_id, similarity")
+                    .gte("similarity", min_similarity)
+                    .lte("similarity", max_similarity)
+                    .order("similarity", desc=False)  # 낮은 유사도부터
+                    .range(offset, offset + page_size - 1)  # 페이징
+                    .execute()
+                )
+
+                page_data = page_response.data
+                if not page_data:
+                    # 더 이상 데이터 없음
+                    break
+
+                pairs.extend(page_data)
+
+                # 마지막 페이지인 경우 종료
+                if len(page_data) < page_size:
+                    break
+
+                offset += page_size
+
+                # 로그 (2페이지 이상일 때만)
+                if offset > page_size:
+                    logger.info(f"  Fetched {len(pairs)} pairs so far (offset: {offset})...")
+
+            step1_duration = time.time() - start_time
+
+            if not pairs:
+                logger.info(
+                    f"No pairs found in similarity range "
+                    f"[{min_similarity:.3f}, {max_similarity:.3f}]"
+                )
+                return []
+
+            logger.info(
+                f"Step 1: Found {len(pairs)} pairs in {step1_duration:.2f}s "
+                f"({len(pairs)//page_size + 1} pages)"
+            )
+
+            # Step 2: thought_units에서 claim, raw_note_id JOIN
+            step2_start = time.time()
+
+            # 모든 thought ID 수집 (중복 제거)
+            thought_ids = set()
+            for p in pairs:
+                thought_ids.add(p["thought_a_id"])
+                thought_ids.add(p["thought_b_id"])
+
+            # 배치 조회 (IN 연산)
+            thoughts_response = await (
+                self.client.table("thought_units")
+                .select("id, claim, raw_note_id")
+                .in_("id", list(thought_ids))
+                .execute()
+            )
+
+            # thought_id → {claim, raw_note_id} 매핑
+            thought_map = {
+                t["id"]: {
+                    "claim": t["claim"],
+                    "raw_note_id": t["raw_note_id"]
+                }
+                for t in thoughts_response.data
+            }
+
+            step2_duration = time.time() - step2_start
+
+            logger.info(
+                f"Step 2: Retrieved {len(thought_map)} thought details in {step2_duration:.2f}s"
+            )
+
+            # Step 3: 결과 조합 (Python 메모리 연산)
+            step3_start = time.time()
+
+            result = []
+            for p in pairs:
+                a_id = p["thought_a_id"]
+                b_id = p["thought_b_id"]
+
+                # thought_map에 없는 경우 스킵 (데이터 정합성 문제)
+                if a_id not in thought_map or b_id not in thought_map:
+                    logger.warning(
+                        f"Missing thought data: thought_a_id={a_id}, thought_b_id={b_id}"
+                    )
+                    continue
+
+                result.append({
+                    "thought_a_id": a_id,
+                    "thought_b_id": b_id,
+                    "thought_a_claim": thought_map[a_id]["claim"],
+                    "thought_b_claim": thought_map[b_id]["claim"],
+                    "similarity": p["similarity"],
+                    "raw_note_id_a": thought_map[a_id]["raw_note_id"],
+                    "raw_note_id_b": thought_map[b_id]["raw_note_id"]
+                })
+
+            step3_duration = time.time() - step3_start
+            total_duration = time.time() - start_time
+
+            logger.info(
+                f"Step 3: Combined {len(result)} pairs in {step3_duration:.2f}s. "
+                f"Total duration: {total_duration:.2f}s"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to get candidates from distance table: {e}")
             raise
 
 

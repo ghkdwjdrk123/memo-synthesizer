@@ -40,22 +40,23 @@ backend/
 ├── main.py
 ├── config.py
 ├── services/
-│   ├── supabase_service.py   # DB CRUD + pgvector
-│   ├── ai_service.py         # LLM calls
-│   ├── notion_service.py     # Notion API
-│   └── rate_limiter.py       # API rate limiting
+│   ├── supabase_service.py         # DB CRUD + pgvector
+│   ├── ai_service.py               # LLM calls
+│   ├── notion_service.py           # Notion API
+│   ├── distance_table_service.py   # Distance Table 관리 (NEW)
+│   └── rate_limiter.py             # API rate limiting
 ├── routers/
-│   ├── pipeline.py           # Pipeline endpoints
-│   └── essays.py             # Essay CRUD
+│   ├── pipeline.py                 # Pipeline endpoints
+│   └── essays.py                   # Essay CRUD
 ├── schemas/
-│   ├── raw.py                # RawNote models
-│   ├── normalized.py         # ThoughtUnit models
-│   ├── zk.py                 # ThoughtPair models
-│   ├── essay.py              # Essay models
-│   └── processing.py         # ProcessingStatus
+│   ├── raw.py                      # RawNote models
+│   ├── normalized.py               # ThoughtUnit models
+│   ├── zk.py                       # ThoughtPair models
+│   ├── essay.py                    # Essay models
+│   └── processing.py               # ProcessingStatus
 ├── utils/
-│   ├── validators.py         # JSON parsing
-│   └── error_handlers.py     # Exception handling
+│   ├── validators.py               # JSON parsing
+│   └── error_handlers.py           # Exception handling
 └── tests/
     ├── conftest.py
     ├── unit/
@@ -155,6 +156,26 @@ CREATE TABLE processing_status (
 );
 CREATE INDEX idx_processing_status_step_status ON processing_status(step, status);
 
+-- 6. Distance Table: 모든 thought 페어의 유사도 사전 계산 (NEW)
+CREATE TABLE thought_pair_distances (
+    id BIGSERIAL PRIMARY KEY,
+    thought_a_id INTEGER NOT NULL REFERENCES thought_units(id) ON DELETE CASCADE,
+    thought_b_id INTEGER NOT NULL REFERENCES thought_units(id) ON DELETE CASCADE,
+    similarity FLOAT NOT NULL CHECK (similarity >= 0 AND similarity <= 1),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT tpd_different_thoughts CHECK (thought_a_id != thought_b_id),
+    CONSTRAINT tpd_ordered_pair CHECK (thought_a_id < thought_b_id),
+    CONSTRAINT tpd_unique_pair UNIQUE(thought_a_id, thought_b_id)
+);
+CREATE INDEX idx_tpd_similarity_range ON thought_pair_distances (similarity);
+CREATE INDEX idx_tpd_thought_a ON thought_pair_distances (thought_a_id);
+CREATE INDEX idx_tpd_thought_b ON thought_pair_distances (thought_b_id);
+
+-- Performance: 조회 0.1초 (vs 실시간 계산 60초+), 600배 개선
+-- 저장 공간: 1,921개 기준 178MB (테이블 118MB + 인덱스 60MB)
+-- Break-even: 7회 조회부터 이득
+
 -- pgvector extension
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
@@ -170,10 +191,15 @@ POST /pipeline/generate-essays       # Step 4: Essay 생성
 POST /pipeline/run-all               # 전체 파이프라인
 
 # Hybrid C Strategy (NEW)
-POST /pipeline/collect-candidates    # 전체 후보 수집 및 pair_candidates 저장
+POST /pipeline/collect-candidates    # 전체 후보 수집 (Distance Table 사용, 0.1초)
 POST /pipeline/sample-initial        # 초기 100개 샘플 평가
 POST /pipeline/score-candidates      # 배치 평가 (백그라운드)
 GET  /essays/recommended             # AI 추천 Essay 후보 조회
+
+# Distance Table (NEW)
+POST /pipeline/distance-table/build  # Distance Table 초기 구축 (~7분, 한 번만 실행)
+GET  /pipeline/distance-table/status # Distance Table 통계 조회
+POST /pipeline/distance-table/update # Distance Table 증분 갱신 (~2초/10개)
 
 # Essays
 GET  /essays                         # Essay 목록 조회
@@ -247,6 +273,73 @@ RETURNS jsonb AS $$
   -- See: backend/docs/supabase_import_jobs.sql
 $$ LANGUAGE plpgsql;
 ```
+
+## Distance Table (초고속 유사도 조회)
+
+Distance Table은 모든 thought 페어의 유사도를 사전 계산하여 저장하는 기능입니다.
+
+### 성능 개선
+- **조회 속도**: 0.1초 (vs 실시간 계산 60초+), **600배 개선**
+- **조회 범위**: 무제한 (80% 범위 검증 완료, 100,000개 안전 상한선)
+- **증분 갱신**: 신규 10개 추가 시 ~2초
+
+### 저장 공간
+- **1,921개 기준**: 178MB (테이블 118MB + 인덱스 60MB)
+- **복잡도**: N×(N-1)/2 페어 (예: 1,921개 → 1.84M 페어)
+- **Break-even**: 7회 조회부터 이득
+
+### 사용 방법
+
+#### 1. 초기 구축 (한 번만 실행)
+```bash
+POST /pipeline/distance-table/build?batch_size=50
+# 예상 시간: 1,921개 기준 ~7분 (순차 배치 처리)
+```
+
+#### 2. 증분 갱신 (자동 또는 수동)
+```bash
+# 자동: extract-thoughts 완료 후 (신규 10개 이상일 때)
+POST /pipeline/extract-thoughts?auto_update_distance_table=true
+
+# 수동: 언제든지 트리거 가능
+POST /pipeline/distance-table/update
+```
+
+#### 3. 통계 조회
+```bash
+GET /pipeline/distance-table/status
+# 응답: total_pairs, min/max/avg similarity
+```
+
+#### 4. 후보 수집 (Distance Table 사용)
+```bash
+POST /pipeline/collect-candidates?use_distance_table=true
+# 기본값: use_distance_table=true (권장)
+# fallback: use_distance_table=false (v4 RPC, 60초+)
+```
+
+### 구현 세부사항
+
+#### RPC 함수
+1. **build_distance_table_batch**: 단일 배치 처리 (Python에서 순차 호출)
+   - 배치 크기: 25-100 (권장 50)
+   - 실행 시간: ~10초/배치
+   - 타임아웃 회피: 각 배치 60초 미만 보장
+
+2. **update_distance_table_incremental**: 증분 갱신
+   - 자동 감지: thought_pair_distances에 없는 thought 자동 감지
+   - 신규 × 기존 페어 생성
+   - 신규 × 신규 페어 생성
+
+#### 인덱스 전략
+- `idx_tpd_similarity_range`: 유사도 범위 조회 최적화 (핵심!)
+- `idx_tpd_thought_a`, `idx_tpd_thought_b`: thought 기반 조회
+
+#### 파일 위치
+- **Service**: `backend/services/distance_table_service.py`
+- **SQL**: `backend/docs/supabase_migrations/010_create_distance_table.sql`
+- **RPC**: `backend/docs/supabase_migrations/011_build_distance_table_rpc.sql`
+- **RPC**: `backend/docs/supabase_migrations/012_incremental_update_rpc.sql`
 
 ## LLM Tasks
 
@@ -357,6 +450,11 @@ MAX_RETRIES=3
 SIMILARITY_MIN=0.05  # 낮은 유사도 = 서로 다른 아이디어, 창의적 조합
 SIMILARITY_MAX=0.35  # 너무 유사하면 새로운 통찰이 없음
 EMBEDDING_DIMENSION=1536
+
+# Distance Table (NEW)
+USE_DISTANCE_TABLE=true        # Distance Table 사용 여부 (기본 true)
+DISTANCE_TABLE_BATCH_SIZE=50   # 초기 구축 배치 크기 (25-100)
+AUTO_UPDATE_DISTANCE_TABLE=true # extract-thoughts 후 자동 갱신 (기본 true)
 ```
 
 ## Code Conventions

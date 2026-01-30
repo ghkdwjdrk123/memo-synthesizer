@@ -7,7 +7,7 @@ RAW → NORMALIZED → ZK → Essay 전체 파이프라인 엔드포인트.
 import asyncio
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 
@@ -19,6 +19,7 @@ from schemas.job import ImportJobCreate, ImportJobStartResponse, ImportJobStatus
 from services.notion_service import NotionService
 from services.ai_service import AIService, get_ai_service
 from services.supabase_service import SupabaseService, get_supabase_service
+from services.distance_table_service import DistanceTableService, get_distance_table_service
 
 logger = logging.getLogger(__name__)
 
@@ -411,18 +412,26 @@ async def get_import_status(
 
 @router.post("/extract-thoughts")
 async def extract_thoughts(
+    auto_update_distance_table: bool = Query(default=True, description="Distance Table 자동 갱신 여부 (기본 True)"),
     supabase_service: SupabaseService = Depends(get_supabase_service),
     ai_service: AIService = Depends(get_ai_service),
+    distance_service: DistanceTableService = Depends(get_distance_table_service),
 ):
     """
     Step 2: RAW 메모에서 사고 단위 추출 및 임베딩 생성.
 
     Args:
+        auto_update_distance_table: Distance Table 자동 갱신 여부 (기본 True)
+            - True: 사고 단위 10개 이상 추출 시 자동 증분 갱신
+            - False: 수동 갱신 (POST /pipeline/distance-table/update)
         supabase_service: Supabase 서비스 (DI)
         ai_service: AI 서비스 (DI)
+        distance_service: DistanceTableService (DI)
 
     Returns:
         dict: 처리 결과 (성공/실패, 추출된 사고 단위 수)
+            - distance_table_updated: bool (자동 갱신 성공 여부)
+            - distance_table_result: dict (갱신 결과, 자동 갱신 시만)
 
     Process:
         1. raw_notes 테이블에서 모든 메모 조회
@@ -430,6 +439,7 @@ async def extract_thoughts(
            a. Claude로 사고 단위 추출 (1-5개)
            b. OpenAI로 각 사고 단위의 임베딩 생성
            c. thought_units 테이블에 저장
+        3. Distance Table 자동 갱신 (10개 이상일 때)
     """
     result = {
         "success": False,
@@ -544,6 +554,31 @@ async def extract_thoughts(
             f"Thought extraction completed: {processed}/{total_notes} notes processed, "
             f"{total_thoughts_extracted} thoughts extracted"
         )
+
+        # Distance Table 자동 갱신 (10개 이상일 때)
+        if auto_update_distance_table and total_thoughts_extracted >= 10:
+            logger.info("Auto-updating distance table...")
+            try:
+                update_result = await distance_service.update_distance_table_incremental()
+                result["distance_table_updated"] = True
+                result["distance_table_result"] = update_result
+
+                logger.info(
+                    f"Distance table auto-update completed: "
+                    f"{update_result.get('new_pairs_inserted', 0)} pairs inserted "
+                    f"({update_result.get('new_thought_count', 0)} new thoughts)"
+                )
+            except Exception as e:
+                logger.warning(f"Distance table update failed (non-critical): {e}")
+                result["distance_table_updated"] = False
+                # 비치명적 에러이므로 계속 진행
+        else:
+            result["distance_table_updated"] = False
+            if total_thoughts_extracted < 10:
+                logger.info(
+                    f"Skipping distance table update: only {total_thoughts_extracted} thoughts "
+                    f"(minimum 10 required)"
+                )
 
     except Exception as e:
         logger.error(f"Thought extraction failed: {e}", exc_info=True)
@@ -1146,103 +1181,450 @@ async def get_essays_list(
 
 
 # ============================================================
-# 하이브리드 C 전략 엔드포인트
+# Distance Table 관리 엔드포인트
 # ============================================================
 
 
-@router.post("/collect-candidates")
-async def collect_candidates(
-    min_similarity: float = Query(default=0.05, ge=0, le=1, description="최소 유사도"),
-    max_similarity: float = Query(default=0.35, ge=0, le=1, description="최대 유사도"),
-    top_k: int = Query(default=20, ge=10, le=100, description="각 thought당 검색할 상위 K개"),
-    supabase_service: SupabaseService = Depends(get_supabase_service),
+@router.post("/distance-table/build")
+async def build_distance_table(
+    batch_size: int = Query(default=50, ge=5, le=100, description="배치 크기 (권장: 50)"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    distance_service: DistanceTableService = Depends(get_distance_table_service),
 ):
     """
-    전체 후보 수집 및 pair_candidates 테이블 저장.
+    Distance Table 초기 구축 (백그라운드 작업, 순차 배치 처리).
 
-    워크플로우:
-        1. find_candidate_pairs() 호출 (Top-K 알고리즘)
-        2. thought_units에서 raw_note_id JOIN
-        3. PairCandidateCreate 객체 생성
-        4. insert_pair_candidates_batch() 호출
+    Performance:
+        - 1,921개 기준: ~7분 (batch_size=50, 39 batches)
+        - 각 배치: ~10초 (60초 타임아웃 안전)
+        - 총 페어 수: ~1,846,210개 (n(n-1)/2)
+
+    Trade-off:
+        - 초기 구축: 7분 (한 번만, 백그라운드)
+        - 조회 시간: 60초+ → 0.1초 (600배 개선)
+        - Break-even: 7회 조회부터 이득
 
     Args:
-        min_similarity: 최소 유사도 (0-1, 기본 0.05)
-        max_similarity: 최대 유사도 (0-1, 기본 0.35)
-        top_k: 각 thought당 검색할 상위 K개 (10-100, 기본 20)
-        supabase_service: Supabase 서비스 (DI)
+        batch_size: 배치 크기 (25-100)
+            - 25: ~5초/배치 (매우 안전하지만 느림)
+            - 50: ~10초/배치 (권장, 안전)
+            - 100: ~20초/배치 (중간 위험, 타임아웃 가능)
+        background_tasks: FastAPI BackgroundTasks (DI)
+        distance_service: DistanceTableService (DI)
 
     Returns:
         {
             "success": bool,
-            "total_candidates": int,
-            "inserted": int,
-            "duplicates": int,
-            "errors": []
+            "message": str  # "Distance table build started in background (~7min, batch_size=50)"
         }
 
     Example:
-        >>> POST /pipeline/collect-candidates?top_k=20
+        >>> POST /pipeline/distance-table/build?batch_size=50
         >>> {
         >>>     "success": true,
+        >>>     "message": "Distance table build started in background (~7min, batch_size=50)"
+        >>> }
+
+    Note:
+        - 백그라운드로 실행되므로 즉시 응답 반환
+        - 진행 상황은 서버 로그에서 확인 가능
+        - 완료 후 GET /pipeline/distance-table/status로 통계 조회
+    """
+    try:
+        logger.info(
+            f"Starting distance table build in background "
+            f"(batch_size={batch_size}, estimated ~7min for 1,921 thoughts)..."
+        )
+
+        # 백그라운드 태스크 추가
+        background_tasks.add_task(
+            distance_service.build_distance_table_batched,
+            batch_size=batch_size
+        )
+
+        return {
+            "success": True,
+            "message": f"Distance table build started in background (~7min, batch_size={batch_size})"
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to start distance table build: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/distance-table/status")
+async def get_distance_table_status(
+    distance_service: DistanceTableService = Depends(get_distance_table_service),
+):
+    """
+    Distance Table 상태 및 통계 조회.
+
+    Returns:
+        {
+            "success": bool,
+            "statistics": {
+                "total_pairs": int,         # 전체 페어 개수
+                "min_similarity": float,    # 최소 유사도
+                "max_similarity": float,    # 최대 유사도
+                "avg_similarity": float     # 평균 유사도
+            }
+        }
+
+    Example:
+        >>> GET /pipeline/distance-table/status
+        >>> {
+        >>>     "success": true,
+        >>>     "statistics": {
+        >>>         "total_pairs": 1846210,
+        >>>         "min_similarity": 0.001,
+        >>>         "max_similarity": 0.999,
+        >>>         "avg_similarity": 0.423
+        >>>     }
+        >>> }
+
+    Note:
+        - 초기 구축 전: total_pairs=0
+        - 초기 구축 후: total_pairs ≈ n(n-1)/2 (1,921개 → 1,846,210)
+    """
+    try:
+        logger.info("Getting distance table status...")
+        stats = await distance_service.get_statistics()
+
+        return {
+            "success": True,
+            "statistics": stats
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get distance table status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/distance-table/update")
+async def update_distance_table(
+    new_thought_ids: Optional[List[int]] = Query(default=None, description="신규 thought IDs (None이면 자동 감지)"),
+    distance_service: DistanceTableService = Depends(get_distance_table_service),
+):
+    """
+    Distance Table 증분 갱신 (수동 트리거).
+
+    자동 감지 모드 (new_thought_ids=None):
+        - thought_pair_distances에 없는 thought 자동 감지
+        - 신규 × 기존 페어 생성
+        - 신규 × 신규 페어 생성
+
+    수동 지정 모드 (new_thought_ids=[...]):
+        - 지정된 thought ID만 처리
+
+    Performance:
+        - 10개 신규 × 1,921 기존 ≈ 2초
+        - 50개 신규 × 1,921 기존 ≈ 10초
+
+    Args:
+        new_thought_ids: 신규 thought ID 목록 (기본 None = 자동 감지)
+        distance_service: DistanceTableService (DI)
+
+    Returns:
+        {
+            "success": bool,
+            "new_thought_count": int,     # 처리된 신규 thought 개수
+            "new_pairs_inserted": int     # 생성된 페어 개수
+        }
+
+    Example:
+        >>> POST /pipeline/distance-table/update
+        >>> {
+        >>>     "success": true,
+        >>>     "new_thought_count": 10,
+        >>>     "new_pairs_inserted": 19210
+        >>> }
+
+    Note:
+        - 자동 감지는 extract-thoughts 실행 후 사용
+        - 수동 지정은 특정 thought만 갱신할 때 사용
+    """
+    try:
+        logger.info(
+            f"Starting distance table incremental update "
+            f"(mode: {'auto-detect' if new_thought_ids is None else f'manual ({len(new_thought_ids)} thoughts)'})..."
+        )
+
+        result = await distance_service.update_distance_table_incremental(new_thought_ids)
+
+        logger.info(
+            f"Distance table updated: {result.get('new_pairs_inserted', 0)} pairs inserted "
+            f"({result.get('new_thought_count', 0)} new thoughts)"
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to update distance table: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# 하이브리드 C 전략 엔드포인트
+# ============================================================
+
+
+@router.get("/distribution")
+async def get_similarity_distribution(
+    force_recalculate: bool = Query(default=False, description="강제 재계산 여부"),
+    supabase_service: SupabaseService = Depends(get_supabase_service),
+):
+    """
+    유사도 분포 조회 및 관리.
+
+    워크플로우:
+        1. DistributionService 초기화
+        2. get_distribution() 호출 (캐시 or 계산)
+        3. 각 전략별 임계값 미리 계산 (프리뷰)
+        4. 결과 반환
+
+    Args:
+        force_recalculate: 강제 재계산 여부 (기본 False, 캐시 활용)
+        supabase_service: Supabase 서비스 (DI)
+
+    Returns:
+        {
+            "thought_count": 1921,
+            "total_pairs": 38420,
+            "percentiles": {
+                "p0": 0.26, "p10": 0.30, "p20": 0.32,
+                "p30": 0.34, "p40": 0.36, "p50": 0.38,
+                "p60": 0.40, "p70": 0.42, "p80": 0.44,
+                "p90": 0.46, "p100": 0.50
+            },
+            "mean": 0.38,
+            "stddev": 0.05,
+            "calculated_at": "2026-01-26T10:00:00",
+            "duration_ms": 5432,
+            "strategies": {
+                "p30_p60": [0.34, 0.40],
+                "p10_p40": [0.30, 0.36],
+                "p0_p30": [0.26, 0.34]
+            }
+        }
+
+    Example:
+        >>> GET /pipeline/distribution  # 캐시 조회
+        >>> GET /pipeline/distribution?force_recalculate=true  # 강제 재계산
+
+    Note:
+        - 분포 계산은 모든 thought_units의 유사도 페어를 분석합니다.
+        - 첫 계산 시 ~5-10초 소요, 이후 캐시 활용 시 <0.1초
+        - strategies는 각 전략별 임계값 범위를 프리뷰로 제공합니다.
+    """
+    try:
+        # 1. DistributionService 초기화
+        from services.distribution_service import DistributionService
+        dist_service = DistributionService(supabase_service)
+
+        # 2. 분포 조회
+        logger.info(f"Getting distribution (force_recalculate={force_recalculate})...")
+        dist = await dist_service.get_distribution(force_recalculate=force_recalculate)
+
+        # 3. 각 전략별 임계값 미리 계산 (프리뷰)
+        strategies_preview = {}
+        for strategy_name in ["p30_p60", "p10_p40", "p0_p30"]:
+            min_sim, max_sim = await dist_service.get_relative_thresholds(
+                strategy=strategy_name
+            )
+            strategies_preview[strategy_name] = [
+                round(min_sim, 3),
+                round(max_sim, 3)
+            ]
+
+        # 4. 결과 반환
+        return {
+            **dist,
+            "strategies": strategies_preview
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get distribution: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/collect-candidates")
+async def collect_candidates(
+    strategy: str = Query(default="p10_p40", description="Percentile strategy: p10_p40, p30_p60, p0_p30, custom"),
+    custom_min_pct: Optional[int] = Query(default=None, ge=0, le=100, description="Custom 최소 백분위수 (strategy=custom일 때)"),
+    custom_max_pct: Optional[int] = Query(default=None, ge=0, le=100, description="Custom 최대 백분위수 (strategy=custom일 때)"),
+    top_k: int = Query(default=20, ge=10, le=100, description="각 thought당 검색할 상위 K개"),
+    use_distance_table: bool = Query(default=True, description="Distance Table 사용 여부 (기본값 True)"),
+    supabase_service: SupabaseService = Depends(get_supabase_service),
+    dist_service = Depends(lambda: None),  # DI 설정 필요 (아래에서 초기화)
+):
+    """
+    전체 후보 수집 및 pair_candidates 테이블 저장 (상대적 임계값 기반).
+
+    워크플로우:
+        1. get_relative_thresholds() 호출 (상대적 임계값 계산)
+        2. Distance Table 사용 여부에 따라 분기:
+           - use_distance_table=True: get_candidates_from_distance_table() (0.1초)
+           - use_distance_table=False: find_candidate_pairs() RPC (60초+)
+        3. thought_units에서 raw_note_id JOIN (Distance Table 사용 시는 이미 포함)
+        4. PairCandidateCreate 객체 생성
+        5. insert_pair_candidates_batch() 호출
+
+    Args:
+        strategy: 백분위수 전략
+            - "p10_p40": 하위 10-40% 구간 (기본, 창의적 조합)
+            - "p30_p60": 하위 30-60% 구간 (안전한 연결)
+            - "p0_p30": 최하위 30% (매우 다른 아이디어)
+            - "custom": custom_min_pct, custom_max_pct 사용
+        custom_min_pct: Custom 최소 백분위수 (strategy=custom일 때)
+        custom_max_pct: Custom 최대 백분위수 (strategy=custom일 때)
+        top_k: 각 thought당 검색할 상위 K개 (10-100, 기본 20)
+        use_distance_table: Distance Table 사용 여부 (기본 True)
+            - True: 초고속 조회 (0.1초, 권장)
+            - False: v4 fallback (60초+, 안정성 검증용)
+        supabase_service: Supabase 서비스 (DI)
+        dist_service: Distribution 서비스 (DI)
+
+    Returns:
+        {
+            "success": bool,
+            "strategy": str,
+            "min_similarity": float,
+            "max_similarity": float,
+            "total_candidates": int,
+            "inserted": int,
+            "duplicates": int,
+            "query_method": str,  # "distance_table" or "v4_fallback"
+            "errors": []
+        }
+
+    Raises:
+        HTTPException(400): 유사도 범위가 80%를 초과하는 경우
+            - Example: custom_min_pct=0, custom_max_pct=100 (100% 범위)
+            - 정상 범위: 30-40% (p10_p40, p30_p60 등)
+            - 메시지: "Invalid similarity range. Please use standard strategies..."
+        HTTPException(500): DB 조회 실패, RPC 에러 등 서버 내부 오류
+
+    Example:
+        >>> POST /pipeline/collect-candidates?strategy=p10_p40&use_distance_table=true
+        >>> {
+        >>>     "success": true,
+        >>>     "strategy": "p10_p40",
+        >>>     "min_similarity": 0.28,
+        >>>     "max_similarity": 0.34,
         >>>     "total_candidates": 30000,
         >>>     "inserted": 28500,
-        >>>     "duplicates": 1500
+        >>>     "duplicates": 1500,
+        >>>     "query_method": "distance_table"
         >>> }
     """
     result = {
         "success": False,
+        "strategy": strategy,
+        "min_similarity": 0.0,
+        "max_similarity": 0.0,
         "total_candidates": 0,
         "inserted": 0,
         "duplicates": 0,
+        "query_method": "",
         "errors": [],
     }
 
     try:
-        # 유사도 범위 검증
-        if min_similarity >= max_similarity:
-            raise HTTPException(
-                status_code=400,
-                detail="min_similarity must be less than max_similarity"
-            )
+        # DistributionService 초기화
+        from services.distribution_service import DistributionService
+        dist_service = DistributionService(supabase_service)
+
+        # 1. 상대적 임계값 계산
+        logger.info(f"Calculating relative thresholds (strategy={strategy})...")
+        min_similarity, max_similarity = await dist_service.get_relative_thresholds(
+            strategy=strategy,
+            custom_range=(custom_min_pct, custom_max_pct) if strategy == "custom" else None
+        )
+
+        result["min_similarity"] = min_similarity
+        result["max_similarity"] = max_similarity
 
         logger.info(
-            f"Collecting candidate pairs (similarity: {min_similarity}-{max_similarity}, top_k={top_k})..."
+            f"Collecting candidate pairs (similarity: {min_similarity:.3f}-{max_similarity:.3f}, "
+            f"use_distance_table={use_distance_table})..."
         )
 
-        # Step 1: 후보 쌍 찾기 (Top-K 알고리즘)
-        candidates = await supabase_service.find_candidate_pairs(
-            min_similarity=min_similarity,
-            max_similarity=max_similarity,
-            top_k=top_k,
-            limit=50000  # 최대 5만 개까지 수집
-        )
+        # 2. 후보 수집 (Distance Table vs v4 fallback)
+        if use_distance_table:
+            # Distance Table 사용 (초고속, 권장, 무제한)
+            logger.info("Using Distance Table (instant query, <0.1s, no limit)...")
+            try:
+                candidates = await supabase_service.get_candidates_from_distance_table(
+                    min_similarity=min_similarity,
+                    max_similarity=max_similarity
+                )
+                result["query_method"] = "distance_table"
+
+                logger.info(f"Retrieved {len(candidates)} candidates from Distance Table")
+            except ValueError as e:
+                # 범위 검증 실패 (80% 초과)
+                error_details = str(e)
+                logger.error(f"Range validation failed: {error_details}")
+                # 사용자에게는 간단한 메시지만 전달 (내부 구조 노출 방지)
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid similarity range. Please use standard strategies (p10_p40, p30_p60, p0_p30) or reduce custom range to 80% or less."
+                )
+        else:
+            # v4 fallback (느림, 60초+)
+            logger.warning("Using v4 fallback (slow, 60s+)...")
+
+            # 후보 쌍 찾기 (Top-K 알고리즘, 필터링 없음)
+            all_candidates = await supabase_service.find_candidate_pairs(
+                min_similarity=0.0,  # SQL 필터링 비활성화
+                max_similarity=1.0,  # SQL 필터링 비활성화
+                top_k=top_k,
+                limit=50000  # 최대 5만 개까지 수집
+            )
+
+            logger.info(f"Retrieved {len(all_candidates)} candidates from SQL (before filtering)")
+
+            # Python 레벨에서 유사도 범위 필터링 (성능 최적화)
+            candidates = [
+                c for c in all_candidates
+                if min_similarity <= c["similarity_score"] <= max_similarity
+            ]
+
+            result["query_method"] = "v4_fallback"
+
+            logger.info(
+                f"Filtered to {len(candidates)} candidates "
+                f"(similarity: {min_similarity:.3f}-{max_similarity:.3f})"
+            )
 
         total_count = len(candidates)
         result["total_candidates"] = total_count
 
         if total_count == 0:
-            logger.warning("No candidate pairs found")
+            logger.warning(
+                f"No candidates in range {min_similarity:.3f}-{max_similarity:.3f}"
+            )
             result["success"] = True
             return result
 
-        logger.info(f"Found {total_count} candidate pairs")
-
-        # Step 2: PairCandidateCreate 객체 생성
+        # 4. PairCandidateCreate 객체 생성
         from schemas.zk import PairCandidateCreate
+
+        # Distance Table은 similarity 키 사용, v4는 similarity_score 키 사용
+        similarity_key = "similarity" if use_distance_table else "similarity_score"
 
         pair_candidates_to_insert = [
             PairCandidateCreate(
                 thought_a_id=c["thought_a_id"],
                 thought_b_id=c["thought_b_id"],
-                similarity=c["similarity_score"],
+                similarity=c[similarity_key],
                 raw_note_id_a=c["raw_note_id_a"],
                 raw_note_id_b=c["raw_note_id_b"]
             )
             for c in candidates
         ]
 
-        # Step 3: 배치 저장
+        # 5. 배치 저장
         logger.info(f"Inserting {len(pair_candidates_to_insert)} candidates to pair_candidates table...")
         batch_result = await supabase_service.insert_pair_candidates_batch(
             pair_candidates_to_insert
@@ -1270,25 +1652,39 @@ async def collect_candidates(
 @router.post("/sample-initial")
 async def sample_initial(
     sample_size: int = Query(default=100, ge=10, le=200, description="샘플링할 후보 개수"),
+    strategy: str = Query(default="p10_p40", description="Percentile strategy: p10_p40, p30_p60, p0_p30, custom"),
+    custom_min_pct: Optional[int] = Query(default=None, ge=0, le=100, description="Custom 최소 백분위수 (strategy=custom일 때)"),
+    custom_max_pct: Optional[int] = Query(default=None, ge=0, le=100, description="Custom 최대 백분위수 (strategy=custom일 때)"),
     supabase_service: SupabaseService = Depends(get_supabase_service),
     ai_service: AIService = Depends(get_ai_service),
 ):
     """
-    초기 100개 샘플 평가.
+    초기 샘플 평가 (상대적 임계값 기반).
 
     워크플로우:
-        1. get_pending_candidates() 호출 (최대 50000개)
-        2. SamplingStrategy.sample_initial() 호출 (100개 선택)
-        3. BatchEvaluationWorker.run_batch() 호출 (평가 + 이동)
+        1. get_relative_thresholds() 호출 (상대적 임계값 계산)
+        2. get_pending_candidates() 호출 (최대 50000개)
+        3. SamplingStrategy.sample_initial() 호출 (샘플 선택)
+        4. BatchEvaluationWorker.run_batch() 호출 (평가 + 이동)
 
     Args:
         sample_size: 샘플링할 후보 개수 (10-200, 기본 100)
+        strategy: 백분위수 전략
+            - "p10_p40": 하위 10-40% 구간 (기본, 창의적 조합)
+            - "p30_p60": 하위 30-60% 구간 (안전한 연결)
+            - "p0_p30": 최하위 30% (매우 다른 아이디어)
+            - "custom": custom_min_pct, custom_max_pct 사용
+        custom_min_pct: Custom 최소 백분위수 (strategy=custom일 때)
+        custom_max_pct: Custom 최대 백분위수 (strategy=custom일 때)
         supabase_service: Supabase 서비스 (DI)
         ai_service: AI 서비스 (DI)
 
     Returns:
         {
             "success": bool,
+            "strategy": str,
+            "min_similarity": float,
+            "max_similarity": float,
             "sampled": int,
             "evaluated": int,
             "migrated": int,
@@ -1296,9 +1692,12 @@ async def sample_initial(
         }
 
     Example:
-        >>> POST /pipeline/sample-initial?sample_size=100
+        >>> POST /pipeline/sample-initial?sample_size=100&strategy=p10_p40
         >>> {
         >>>     "success": true,
+        >>>     "strategy": "p10_p40",
+        >>>     "min_similarity": 0.28,
+        >>>     "max_similarity": 0.34,
         >>>     "sampled": 100,
         >>>     "evaluated": 98,
         >>>     "migrated": 45
@@ -1306,6 +1705,9 @@ async def sample_initial(
     """
     result = {
         "success": False,
+        "strategy": strategy,
+        "min_similarity": 0.0,
+        "max_similarity": 0.0,
         "sampled": 0,
         "evaluated": 0,
         "migrated": 0,
@@ -1313,9 +1715,23 @@ async def sample_initial(
     }
 
     try:
+        # DistributionService 초기화
+        from services.distribution_service import DistributionService
+        dist_service = DistributionService(supabase_service)
+
+        # 1. 상대적 임계값 계산
+        logger.info(f"Calculating relative thresholds (strategy={strategy})...")
+        min_similarity, max_similarity = await dist_service.get_relative_thresholds(
+            strategy=strategy,
+            custom_range=(custom_min_pct, custom_max_pct) if strategy == "custom" else None
+        )
+
+        result["min_similarity"] = min_similarity
+        result["max_similarity"] = max_similarity
+
         logger.info(f"Starting initial sampling (sample_size={sample_size})...")
 
-        # Step 1: pending 후보 조회
+        # 2. pending 후보 조회
         logger.info("Fetching pending candidates...")
         pending_candidates = await supabase_service.get_pending_candidates(limit=50000)
 
@@ -1326,11 +1742,11 @@ async def sample_initial(
 
         logger.info(f"Found {len(pending_candidates)} pending candidates")
 
-        # Step 2: 샘플링
+        # 3. 샘플링
         from services.sampling import SamplingStrategy
 
-        strategy = SamplingStrategy()
-        sampled = strategy.sample_initial(
+        sampling_strategy = SamplingStrategy(distribution_service=dist_service)
+        sampled = await sampling_strategy.sample_initial(
             candidates=pending_candidates,
             target_count=sample_size
         )
@@ -1343,7 +1759,7 @@ async def sample_initial(
             result["errors"].append("Sampling failed to select candidates")
             return result
 
-        # Step 3: 배치 평가
+        # 4. 배치 평가
         from services.batch_worker import BatchEvaluationWorker
 
         worker = BatchEvaluationWorker(

@@ -78,26 +78,26 @@ class SamplingStrategy:
 
 ### 3.1 핵심 원칙
 - **자동 적응**: 데이터 특성에 맞게 임계값이 자동으로 조정
-- **명확한 의미**: "약한 연결 = 하위 30-60% 유사도 구간"
+- **명확한 의미**: "약한 연결 = 하위 10-40% 유사도 구간" (창의적 조합)
 - **성능 최적화**: 분포 계산 비용 vs 캐싱 전략 균형
 - **하위 호환성**: 기존 코드 최소 수정
 
 ### 3.2 상대적 임계값 정의
 ```
 전체 페어 유사도 분포: [0.26 ──────────────── 0.50]
-                         P0    P30    P60    P100
+                         P0    P10    P40    P100
 
-"약한 연결" = P30 ~ P60 구간
-  예: P30 = 0.32, P60 = 0.41
-  → min_similarity = 0.32, max_similarity = 0.41
+"약한 연결" = P10 ~ P40 구간 (창의적 조합)
+  예: P10 = 0.28, P40 = 0.34
+  → min_similarity = 0.28, max_similarity = 0.34
 ```
 
 **선택 기준**:
-- P30-P60: 중간 구간 제외, 양쪽 극단 선호 (다양한 조합)
-- P10-P40: 낮은 유사도 집중 (창의적 조합)
+- P10-P40: 낮은 유사도 집중 (창의적 조합) ✅ 기본값
+- P30-P60: 중간 구간 (안전한 조합)
 - P0-P30: 최하위만 (매우 다른 아이디어)
 
-→ **기본값: P30-P60** (균형)
+→ **기본값: P10-P40** (창의적 조합 선호)
 
 ### 3.3 3-Tier 샘플링 재정의
 ```
@@ -106,16 +106,21 @@ class SamplingStrategy:
   Mid: 0.15-0.25
   High: 0.25-0.35
 
-개선 (상대값):
-  Low: P30 - P40 (하위 10% 구간)
-  Mid: P40 - P50 (중간 10% 구간)
-  High: P50 - P60 (상위 10% 구간)
+개선 (백분위수 기반, P10-P40 전략):
+  Low:  P10 - P20 (하위 10-20%, 가장 다른 아이디어)
+  Mid:  P20 - P30 (하위 20-30%, 중간 정도)
+  High: P30 - P40 (하위 30-40%, 약간 유사)
 
 예시 (실제 0.26-0.50 분포):
-  Low: 0.32 - 0.35
-  Mid: 0.35 - 0.38
-  High: 0.38 - 0.41
+  Low:  ~0.28 - 0.30  (약 3,842개 페어)
+  Mid:  ~0.30 - 0.32  (약 3,842개 페어)
+  High: ~0.32 - 0.34  (약 3,842개 페어)
 ```
+
+**백분위수 기반 방식 선택 이유**:
+- 각 Tier가 정확히 **전체의 10%씩** 차지 (균등 분포 보장)
+- Mid와 High가 명확히 구분됨 (3등분 방식의 문제 해결)
+- 샘플링 시 안정적인 다양성 확보
 
 ---
 
@@ -400,8 +405,8 @@ class DistributionService:
         상대적 임계값 계산
 
         전략:
-            - "p30_p60": 하위 30-60% 구간 (기본, 약한 연결)
-            - "p10_p40": 하위 10-40% 구간 (창의적 조합)
+            - "p10_p40": 하위 10-40% 구간 (기본, 창의적 조합)
+            - "p30_p60": 하위 30-60% 구간 (안전한 연결)
             - "p0_p30": 최하위 30% (매우 다른 아이디어)
             - "custom": custom_range 사용 (예: (20, 50) → P20-P50)
 
@@ -409,8 +414,8 @@ class DistributionService:
             (min_similarity, max_similarity)
 
         Example:
-            >>> await get_relative_thresholds("p30_p60")
-            (0.32, 0.41)
+            >>> await get_relative_thresholds("p10_p40")
+            (0.28, 0.34)
         """
         dist = await self.get_distribution()
         percentiles = dist["percentiles"]
@@ -421,10 +426,10 @@ class DistributionService:
             min_pct, max_pct = custom_range
             min_key = f"p{min_pct}"
             max_key = f"p{max_pct}"
-        elif strategy == "p30_p60":
-            min_key, max_key = "p30", "p60"
         elif strategy == "p10_p40":
             min_key, max_key = "p10", "p40"
+        elif strategy == "p30_p60":
+            min_key, max_key = "p30", "p60"
         elif strategy == "p0_p30":
             min_key, max_key = "p0", "p30"
         else:
@@ -505,20 +510,20 @@ class SamplingStrategy:
         self,
         candidates: List[Dict[str, Any]],
         target_count: int = 100,
-        strategy: str = "p30_p60",  # 추가
-        custom_range: Optional[Tuple[int, int]] = None  # 추가
+        strategy: str = "p10_p40",  # 기본값 변경
+        custom_range: Optional[Tuple[int, int]] = None
     ) -> List[Dict[str, Any]]:
         """
-        초기 샘플 선택 (3-tier 전략, 상대적 임계값 기반)
+        초기 샘플 선택 (3-tier 전략, 백분위수 기반)
 
         Process:
-            1. DistributionService에서 전체 범위 임계값 계산
-               예: P30-P60 → min=0.32, max=0.41
+            1. DistributionService에서 전체 범위 백분위수 조회
+               예: P10-P40 전략 → 전체 분포 조회
 
-            2. 3-tier 구간 동적 계산
-               Low: P30-P40 (0.32-0.35)
-               Mid: P40-P50 (0.35-0.38)
-               High: P50-P60 (0.38-0.41)
+            2. 3-tier 구간 백분위수 직접 사용 (균등 분포 보장)
+               Low:  P10-P20 (하위 10%, 가장 다른 아이디어)
+               Mid:  P20-P30 (하위 10%, 중간 정도)
+               High: P30-P40 (하위 10%, 약간 유사)
 
             3. 각 티어별 샘플링 수행
         """
@@ -526,17 +531,36 @@ class SamplingStrategy:
             logger.warning("No candidates to sample")
             return []
 
-        # 1. 상대적 임계값 계산
-        min_sim, max_sim = await self.dist_service.get_relative_thresholds(
-            strategy=strategy,
-            custom_range=custom_range
-        )
+        # 1. 전체 분포 조회
+        dist = await self.dist_service.get_distribution()
+        percentiles = dist["percentiles"]
 
-        # 2. 3-tier 구간 동적 계산 (전체 범위의 3등분)
-        range_width = (max_sim - min_sim) / 3.0
-        low_range = (min_sim, min_sim + range_width)
-        mid_range = (min_sim + range_width, min_sim + 2 * range_width)
-        high_range = (min_sim + 2 * range_width, max_sim)
+        # 2. 3-tier 구간 백분위수 직접 사용 (strategy에 따라 동적 계산)
+        if strategy == "p10_p40":
+            low_range = (percentiles["p10"], percentiles["p20"])
+            mid_range = (percentiles["p20"], percentiles["p30"])
+            high_range = (percentiles["p30"], percentiles["p40"])
+        elif strategy == "p30_p60":
+            low_range = (percentiles["p30"], percentiles["p40"])
+            mid_range = (percentiles["p40"], percentiles["p50"])
+            high_range = (percentiles["p50"], percentiles["p60"])
+        elif strategy == "p0_p30":
+            low_range = (percentiles["p0"], percentiles["p10"])
+            mid_range = (percentiles["p10"], percentiles["p20"])
+            high_range = (percentiles["p20"], percentiles["p30"])
+        elif strategy == "custom":
+            if not custom_range:
+                raise ValueError("custom_range required for custom strategy")
+            min_pct, max_pct = custom_range
+            # Custom은 3등분 방식 사용
+            min_sim = percentiles[f"p{min_pct}"]
+            max_sim = percentiles[f"p{max_pct}"]
+            range_width = (max_sim - min_sim) / 3.0
+            low_range = (min_sim, min_sim + range_width)
+            mid_range = (min_sim + range_width, min_sim + 2 * range_width)
+            high_range = (min_sim + 2 * range_width, max_sim)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
 
         logger.info(
             f"Dynamic tier ranges: "
@@ -588,7 +612,7 @@ from backend.services.distribution_service import DistributionService
 
 @router.post("/collect-candidates")
 async def collect_candidates(
-    strategy: str = Query(default="p30_p60", description="Percentile strategy: p30_p60, p10_p40, p0_p30, custom"),
+    strategy: str = Query(default="p10_p40", description="Percentile strategy: p10_p40, p30_p60, p0_p30, custom"),
     custom_min_pct: Optional[int] = Query(default=None, ge=0, le=100),
     custom_max_pct: Optional[int] = Query(default=None, ge=0, le=100),
     top_k: int = Query(default=20, ge=1, le=100),
@@ -600,8 +624,8 @@ async def collect_candidates(
 
     Args:
         strategy: 백분위수 전략
-            - "p30_p60": 하위 30-60% 구간 (기본, 약한 연결)
-            - "p10_p40": 하위 10-40% 구간 (창의적)
+            - "p10_p40": 하위 10-40% 구간 (기본, 창의적 조합)
+            - "p30_p60": 하위 30-60% 구간 (안전한 연결)
             - "p0_p30": 최하위 30% (매우 다른 아이디어)
             - "custom": custom_min_pct, custom_max_pct 사용
         custom_min_pct: 커스텀 최소 백분위수 (0-100)
@@ -609,7 +633,7 @@ async def collect_candidates(
         top_k: 각 thought당 top-k 유사 페어 수
 
     Example:
-        POST /pipeline/collect-candidates?strategy=p30_p60&top_k=20
+        POST /pipeline/collect-candidates?strategy=p10_p40&top_k=20
         POST /pipeline/collect-candidates?strategy=custom&custom_min_pct=20&custom_max_pct=50
     """
     try:
@@ -641,7 +665,7 @@ async def collect_candidates(
 @router.post("/sample-initial")
 async def sample_initial(
     target_count: int = Query(default=100, ge=10, le=1000),
-    strategy: str = Query(default="p30_p60"),
+    strategy: str = Query(default="p10_p40"),
     custom_min_pct: Optional[int] = Query(default=None),
     custom_max_pct: Optional[int] = Query(default=None),
     supabase_service: SupabaseService = Depends(get_supabase_service),
@@ -652,7 +676,7 @@ async def sample_initial(
 
     Args:
         target_count: 샘플 개수 (기본 100)
-        strategy: 샘플링 전략 (p30_p60, p10_p40, p0_p30, custom)
+        strategy: 샘플링 전략 (p10_p40, p30_p60, p0_p30, custom)
         custom_min_pct: 커스텀 최소 백분위수
         custom_max_pct: 커스텀 최대 백분위수
     """

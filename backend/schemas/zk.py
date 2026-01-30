@@ -3,6 +3,7 @@ Pydantic schemas for ZK (Zettelkasten) layer - thought pairs.
 """
 
 from datetime import datetime
+from uuid import UUID
 from pydantic import BaseModel, Field
 
 
@@ -59,6 +60,7 @@ class ThoughtPairCreate(BaseModel):
     similarity_score: float = Field(..., ge=0, le=1, description="Cosine similarity")
     connection_reason: str = Field(
         ...,
+        min_length=1,
         max_length=500,
         description="Claude-generated connection reason"
     )
@@ -97,8 +99,8 @@ class PairCandidateCreate(BaseModel):
     thought_a_id: int = Field(..., description="First thought ID (a < b)")
     thought_b_id: int = Field(..., description="Second thought ID (a < b)")
     similarity: float = Field(..., ge=0, le=1, description="Cosine similarity (1 - cosine_distance)")
-    raw_note_id_a: str = Field(..., description="Source note ID for thought A (UUID)")
-    raw_note_id_b: str = Field(..., description="Source note ID for thought B (UUID)")
+    raw_note_id_a: UUID = Field(..., description="Source note ID for thought A")
+    raw_note_id_b: UUID = Field(..., description="Source note ID for thought B")
 
 
 class PairCandidateDB(PairCandidateCreate):

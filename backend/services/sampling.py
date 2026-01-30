@@ -1,8 +1,8 @@
 """
-Sampling strategy for thought pair candidates
+Sampling strategy for thought pair candidates (상대적 백분위수 기반)
 """
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from collections import defaultdict
 import random
 
@@ -11,36 +11,33 @@ logger = logging.getLogger(__name__)
 
 class SamplingStrategy:
     """
-    사고 단위 페어 후보 샘플링 전략
+    사고 단위 페어 후보 샘플링 전략 (백분위수 기반)
 
-    유사도 구간별 분할 및 raw_note 다양성을 고려한 샘플링
+    유사도 구간을 절대값이 아닌 백분위수로 동적 분할
+    raw_note 다양성을 고려한 샘플링
 
     Usage:
-        strategy = SamplingStrategy()
-        sampled = strategy.sample_initial(candidates, target_count=100)
+        from services.distribution_service import DistributionService
+        dist_service = DistributionService(supabase_service)
+        strategy = SamplingStrategy(distribution_service=dist_service)
+        sampled = await strategy.sample_initial(candidates, target_count=100, strategy="p10_p40")
     """
 
     def __init__(
         self,
-        low_range: Tuple[float, float] = (0.05, 0.15),
-        mid_range: Tuple[float, float] = (0.15, 0.25),
-        high_range: Tuple[float, float] = (0.25, 0.35),
+        distribution_service,
         low_ratio: float = 0.4,
         mid_ratio: float = 0.35,
         high_ratio: float = 0.25
     ):
         """
         Args:
-            low_range: 낮은 유사도 구간 (창의적 조합)
-            mid_range: 중간 유사도 구간
-            high_range: 높은 유사도 구간
+            distribution_service: DistributionService 인스턴스
             low_ratio: 낮은 구간 샘플링 비율 (40%)
             mid_ratio: 중간 구간 샘플링 비율 (35%)
             high_ratio: 높은 구간 샘플링 비율 (25%)
         """
-        self.low_range = low_range
-        self.mid_range = mid_range
-        self.high_range = high_range
+        self.dist_service = distribution_service
         self.low_ratio = low_ratio
         self.mid_ratio = mid_ratio
         self.high_ratio = high_ratio
@@ -50,13 +47,15 @@ class SamplingStrategy:
         if abs(total_ratio - 1.0) > 0.001:
             raise ValueError(f"비율 합계가 1.0이 아닙니다: {total_ratio}")
 
-    def sample_initial(
+    async def sample_initial(
         self,
         candidates: List[Dict[str, Any]],
-        target_count: int = 100
+        target_count: int = 100,
+        strategy: str = "p10_p40",
+        custom_range: Optional[Tuple[int, int]] = None
     ) -> List[Dict[str, Any]]:
         """
-        초기 샘플링 수행
+        초기 샘플링 수행 (백분위수 기반)
 
         Args:
             candidates: pair_candidates 레코드 목록
@@ -67,6 +66,12 @@ class SamplingStrategy:
                 - raw_note_id_a: str (UUID)
                 - raw_note_id_b: str (UUID)
             target_count: 목표 샘플 개수
+            strategy: 백분위수 전략
+                - "p10_p40": 하위 10-40% (기본, 창의적 조합)
+                - "p30_p60": 하위 30-60% (안전한 조합)
+                - "p0_p30": 최하위 30%
+                - "custom": custom_range 사용
+            custom_range: 커스텀 백분위수 범위 (예: (20, 50))
 
         Returns:
             샘플링된 후보 목록 (원본 레코드 유지)
@@ -78,17 +83,53 @@ class SamplingStrategy:
             )
             return candidates
 
-        # 1. 유사도 구간별 분할
-        low_group = self._filter_by_similarity(candidates, *self.low_range)
-        mid_group = self._filter_by_similarity(candidates, *self.mid_range)
-        high_group = self._filter_by_similarity(candidates, *self.high_range)
+        # 1. 전체 분포 조회
+        dist = await self.dist_service.get_distribution()
+        percentiles = dist["percentiles"]
+
+        # 2. 3-tier 구간 백분위수 직접 사용 (strategy에 따라 동적 계산)
+        if strategy == "p10_p40":
+            low_range = (percentiles["p10"], percentiles["p20"])
+            mid_range = (percentiles["p20"], percentiles["p30"])
+            high_range = (percentiles["p30"], percentiles["p40"])
+        elif strategy == "p30_p60":
+            low_range = (percentiles["p30"], percentiles["p40"])
+            mid_range = (percentiles["p40"], percentiles["p50"])
+            high_range = (percentiles["p50"], percentiles["p60"])
+        elif strategy == "p0_p30":
+            low_range = (percentiles["p0"], percentiles["p10"])
+            mid_range = (percentiles["p10"], percentiles["p20"])
+            high_range = (percentiles["p20"], percentiles["p30"])
+        elif strategy == "custom":
+            if not custom_range:
+                raise ValueError("custom_range required for custom strategy")
+            min_pct, max_pct = custom_range
+            # Custom은 3등분 방식 사용
+            min_sim = percentiles[f"p{min_pct}"]
+            max_sim = percentiles[f"p{max_pct}"]
+            range_width = (max_sim - min_sim) / 3.0
+            low_range = (min_sim, min_sim + range_width)
+            mid_range = (min_sim + range_width, min_sim + 2 * range_width)
+            high_range = (min_sim + 2 * range_width, max_sim)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        logger.info(
+            f"Dynamic tier ranges ({strategy}): "
+            f"Low={low_range}, Mid={mid_range}, High={high_range}"
+        )
+
+        # 3. 유사도 구간별 분할
+        low_group = self._filter_by_similarity(candidates, *low_range)
+        mid_group = self._filter_by_similarity(candidates, *mid_range)
+        high_group = self._filter_by_similarity(candidates, *high_range)
 
         logger.info(
             f"유사도 구간별 후보 수 - Low: {len(low_group)}, "
             f"Mid: {len(mid_group)}, High: {len(high_group)}"
         )
 
-        # 2. 각 구간별 목표 개수 계산
+        # 4. 각 구간별 목표 개수 계산
         low_target = int(target_count * self.low_ratio)
         mid_target = int(target_count * self.mid_ratio)
         high_target = int(target_count * self.high_ratio)
@@ -97,12 +138,12 @@ class SamplingStrategy:
         remaining = target_count - (low_target + mid_target + high_target)
         low_target += remaining
 
-        # 3. 각 구간에서 다양성 샘플링
+        # 5. 각 구간에서 다양성 샘플링
         sampled_low = self._diverse_sample(low_group, low_target)
         sampled_mid = self._diverse_sample(mid_group, mid_target)
         sampled_high = self._diverse_sample(high_group, high_target)
 
-        # 4. 결과 합치기
+        # 6. 결과 합치기
         result = sampled_low + sampled_mid + sampled_high
 
         logger.info(

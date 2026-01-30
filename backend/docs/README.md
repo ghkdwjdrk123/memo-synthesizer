@@ -115,6 +115,7 @@ backend/
 │   ├── ai_service.py       # AI (Claude, OpenAI) 통합
 │   ├── supabase_service.py # Supabase DB 연동
 │   ├── notion_service.py   # Notion API 연동
+│   ├── distance_table_service.py  # Distance Table 관리 (NEW)
 │   └── ...
 ├── schemas/                # Pydantic 스키마
 │   ├── __init__.py
@@ -136,6 +137,9 @@ backend/
 - `supabase_setup.sql`: Supabase 데이터베이스 초기화 SQL
 - `supabase_verification_queries.sql`: DB 상태 확인 쿼리 모음
 - `setup_database.py`: Python 기반 DB 초기화 스크립트
+- `supabase_migrations/`: SQL 마이그레이션 파일 (RPC 함수, 스키마 변경)
+  - `001-009`: 증분 import, HNSW 인덱스, 후보 검색, 분포 계산 등
+  - `010-012`: **Distance Table** (초고속 유사도 조회, NEW) ⭐
 
 #### temp/ - 임시 파일
 개발 과정에서 생성된 임시 파일들을 보관합니다. (`.gitignore`에 포함)
@@ -184,6 +188,30 @@ python docs/setup_database.py
 DB 초기화 후 다음 파일로 상태를 확인할 수 있습니다:
 - `docs/supabase_verification_queries.sql`: 테이블, 인덱스, 데이터 확인 쿼리
 - `docs/VERIFICATION_SUMMARY.md`: Step별 검증 체크리스트
+
+## 주요 기능
+
+### 1. 증분 Import (RPC 기반 변경 감지)
+- **성능**: 변경 감지 0.2초 (vs 전체 스캔 60초)
+- **동작**: 신규/수정/삭제 페이지만 자동 감지하여 가져오기
+- **구현**: RPC 함수 `get_changed_pages` (001_get_changed_pages.sql)
+
+### 2. Distance Table (초고속 유사도 조회) ⭐
+- **성능**: 0.1초 (vs 실시간 계산 60초+), **600배 개선**
+- **용량**: 1,921개 기준 178MB (테이블 118MB + 인덱스 60MB)
+- **증분 갱신**: 신규 10개 추가 시 ~2초
+- **조회 범위**: 무제한 (80% 범위 검증 완료, 100,000개 안전 상한선)
+- **Break-even**: 7회 조회부터 이득
+- **구현**:
+  - 테이블: `thought_pair_distances` (010_create_distance_table.sql)
+  - RPC: `build_distance_table_batch` (011_build_distance_table_rpc.sql)
+  - RPC: `update_distance_table_incremental` (012_incremental_update_rpc.sql)
+  - Service: `backend/services/distance_table_service.py`
+
+### 3. Hybrid Strategy C (상대적 백분위수 기반 후보 수집)
+- **로직**: 전체 분포 대비 p10~p40 범위 (낮은 유사도 = 약한 연결)
+- **평가**: Claude Sonnet 4.5 기반 논리적 확장 가능성 점수
+- **추천**: AI 평가 점수 기반 상위 후보 제시
 
 ## 외부 서비스
 
