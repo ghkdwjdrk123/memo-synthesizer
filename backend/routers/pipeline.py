@@ -19,7 +19,8 @@ from schemas.job import ImportJobCreate, ImportJobStartResponse, ImportJobStatus
 from services.notion_service import NotionService
 from services.ai_service import AIService, get_ai_service
 from services.supabase_service import SupabaseService, get_supabase_service
-from services.distance_table_service import DistanceTableService, get_distance_table_service
+from services.candidate_mining_service import CandidateMiningService, get_candidate_mining_service
+from services.distribution_service import DistributionService, get_distribution_service
 
 logger = logging.getLogger(__name__)
 
@@ -412,26 +413,18 @@ async def get_import_status(
 
 @router.post("/extract-thoughts")
 async def extract_thoughts(
-    auto_update_distance_table: bool = Query(default=True, description="Distance Table 자동 갱신 여부 (기본 True)"),
     supabase_service: SupabaseService = Depends(get_supabase_service),
     ai_service: AIService = Depends(get_ai_service),
-    distance_service: DistanceTableService = Depends(get_distance_table_service),
 ):
     """
     Step 2: RAW 메모에서 사고 단위 추출 및 임베딩 생성.
 
     Args:
-        auto_update_distance_table: Distance Table 자동 갱신 여부 (기본 True)
-            - True: 사고 단위 10개 이상 추출 시 자동 증분 갱신
-            - False: 수동 갱신 (POST /pipeline/distance-table/update)
         supabase_service: Supabase 서비스 (DI)
         ai_service: AI 서비스 (DI)
-        distance_service: DistanceTableService (DI)
 
     Returns:
         dict: 처리 결과 (성공/실패, 추출된 사고 단위 수)
-            - distance_table_updated: bool (자동 갱신 성공 여부)
-            - distance_table_result: dict (갱신 결과, 자동 갱신 시만)
 
     Process:
         1. raw_notes 테이블에서 모든 메모 조회
@@ -439,7 +432,6 @@ async def extract_thoughts(
            a. Claude로 사고 단위 추출 (1-5개)
            b. OpenAI로 각 사고 단위의 임베딩 생성
            c. thought_units 테이블에 저장
-        3. Distance Table 자동 갱신 (10개 이상일 때)
     """
     result = {
         "success": False,
@@ -554,31 +546,6 @@ async def extract_thoughts(
             f"Thought extraction completed: {processed}/{total_notes} notes processed, "
             f"{total_thoughts_extracted} thoughts extracted"
         )
-
-        # Distance Table 자동 갱신 (10개 이상일 때)
-        if auto_update_distance_table and total_thoughts_extracted >= 10:
-            logger.info("Auto-updating distance table...")
-            try:
-                update_result = await distance_service.update_distance_table_incremental()
-                result["distance_table_updated"] = True
-                result["distance_table_result"] = update_result
-
-                logger.info(
-                    f"Distance table auto-update completed: "
-                    f"{update_result.get('new_pairs_inserted', 0)} pairs inserted "
-                    f"({update_result.get('new_thought_count', 0)} new thoughts)"
-                )
-            except Exception as e:
-                logger.warning(f"Distance table update failed (non-critical): {e}")
-                result["distance_table_updated"] = False
-                # 비치명적 에러이므로 계속 진행
-        else:
-            result["distance_table_updated"] = False
-            if total_thoughts_extracted < 10:
-                logger.info(
-                    f"Skipping distance table update: only {total_thoughts_extracted} thoughts "
-                    f"(minimum 10 required)"
-                )
 
     except Exception as e:
         logger.error(f"Thought extraction failed: {e}", exc_info=True)
@@ -1181,189 +1148,6 @@ async def get_essays_list(
 
 
 # ============================================================
-# Distance Table 관리 엔드포인트
-# ============================================================
-
-
-@router.post("/distance-table/build")
-async def build_distance_table(
-    batch_size: int = Query(default=50, ge=5, le=100, description="배치 크기 (권장: 50)"),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    distance_service: DistanceTableService = Depends(get_distance_table_service),
-):
-    """
-    Distance Table 초기 구축 (백그라운드 작업, 순차 배치 처리).
-
-    Performance:
-        - 1,921개 기준: ~7분 (batch_size=50, 39 batches)
-        - 각 배치: ~10초 (60초 타임아웃 안전)
-        - 총 페어 수: ~1,846,210개 (n(n-1)/2)
-
-    Trade-off:
-        - 초기 구축: 7분 (한 번만, 백그라운드)
-        - 조회 시간: 60초+ → 0.1초 (600배 개선)
-        - Break-even: 7회 조회부터 이득
-
-    Args:
-        batch_size: 배치 크기 (25-100)
-            - 25: ~5초/배치 (매우 안전하지만 느림)
-            - 50: ~10초/배치 (권장, 안전)
-            - 100: ~20초/배치 (중간 위험, 타임아웃 가능)
-        background_tasks: FastAPI BackgroundTasks (DI)
-        distance_service: DistanceTableService (DI)
-
-    Returns:
-        {
-            "success": bool,
-            "message": str  # "Distance table build started in background (~7min, batch_size=50)"
-        }
-
-    Example:
-        >>> POST /pipeline/distance-table/build?batch_size=50
-        >>> {
-        >>>     "success": true,
-        >>>     "message": "Distance table build started in background (~7min, batch_size=50)"
-        >>> }
-
-    Note:
-        - 백그라운드로 실행되므로 즉시 응답 반환
-        - 진행 상황은 서버 로그에서 확인 가능
-        - 완료 후 GET /pipeline/distance-table/status로 통계 조회
-    """
-    try:
-        logger.info(
-            f"Starting distance table build in background "
-            f"(batch_size={batch_size}, estimated ~7min for 1,921 thoughts)..."
-        )
-
-        # 백그라운드 태스크 추가
-        background_tasks.add_task(
-            distance_service.build_distance_table_batched,
-            batch_size=batch_size
-        )
-
-        return {
-            "success": True,
-            "message": f"Distance table build started in background (~7min, batch_size={batch_size})"
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to start distance table build: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/distance-table/status")
-async def get_distance_table_status(
-    distance_service: DistanceTableService = Depends(get_distance_table_service),
-):
-    """
-    Distance Table 상태 및 통계 조회.
-
-    Returns:
-        {
-            "success": bool,
-            "statistics": {
-                "total_pairs": int,         # 전체 페어 개수
-                "min_similarity": float,    # 최소 유사도
-                "max_similarity": float,    # 최대 유사도
-                "avg_similarity": float     # 평균 유사도
-            }
-        }
-
-    Example:
-        >>> GET /pipeline/distance-table/status
-        >>> {
-        >>>     "success": true,
-        >>>     "statistics": {
-        >>>         "total_pairs": 1846210,
-        >>>         "min_similarity": 0.001,
-        >>>         "max_similarity": 0.999,
-        >>>         "avg_similarity": 0.423
-        >>>     }
-        >>> }
-
-    Note:
-        - 초기 구축 전: total_pairs=0
-        - 초기 구축 후: total_pairs ≈ n(n-1)/2 (1,921개 → 1,846,210)
-    """
-    try:
-        logger.info("Getting distance table status...")
-        stats = await distance_service.get_statistics()
-
-        return {
-            "success": True,
-            "statistics": stats
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to get distance table status: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/distance-table/update")
-async def update_distance_table(
-    new_thought_ids: Optional[List[int]] = Query(default=None, description="신규 thought IDs (None이면 자동 감지)"),
-    distance_service: DistanceTableService = Depends(get_distance_table_service),
-):
-    """
-    Distance Table 증분 갱신 (수동 트리거).
-
-    자동 감지 모드 (new_thought_ids=None):
-        - thought_pair_distances에 없는 thought 자동 감지
-        - 신규 × 기존 페어 생성
-        - 신규 × 신규 페어 생성
-
-    수동 지정 모드 (new_thought_ids=[...]):
-        - 지정된 thought ID만 처리
-
-    Performance:
-        - 10개 신규 × 1,921 기존 ≈ 2초
-        - 50개 신규 × 1,921 기존 ≈ 10초
-
-    Args:
-        new_thought_ids: 신규 thought ID 목록 (기본 None = 자동 감지)
-        distance_service: DistanceTableService (DI)
-
-    Returns:
-        {
-            "success": bool,
-            "new_thought_count": int,     # 처리된 신규 thought 개수
-            "new_pairs_inserted": int     # 생성된 페어 개수
-        }
-
-    Example:
-        >>> POST /pipeline/distance-table/update
-        >>> {
-        >>>     "success": true,
-        >>>     "new_thought_count": 10,
-        >>>     "new_pairs_inserted": 19210
-        >>> }
-
-    Note:
-        - 자동 감지는 extract-thoughts 실행 후 사용
-        - 수동 지정은 특정 thought만 갱신할 때 사용
-    """
-    try:
-        logger.info(
-            f"Starting distance table incremental update "
-            f"(mode: {'auto-detect' if new_thought_ids is None else f'manual ({len(new_thought_ids)} thoughts)'})..."
-        )
-
-        result = await distance_service.update_distance_table_incremental(new_thought_ids)
-
-        logger.info(
-            f"Distance table updated: {result.get('new_pairs_inserted', 0)} pairs inserted "
-            f"({result.get('new_thought_count', 0)} new thoughts)"
-        )
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Failed to update distance table: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================
 # 하이브리드 C 전략 엔드포인트
 # ============================================================
 
@@ -1952,3 +1736,291 @@ async def get_recommended_essays(
         raise HTTPException(status_code=500, detail=str(e))
 
     return result
+
+
+# ============================================================
+# 샘플링 기반 마이닝 엔드포인트 (신규)
+# ============================================================
+
+
+@router.post("/mine-candidates/batch")
+async def mine_candidates_batch(
+    last_src_id: int = Query(default=0, ge=0, description="마지막 처리한 src ID (키셋 페이징)"),
+    src_batch: int = Query(default=30, ge=10, le=100, description="배치당 src 수"),
+    dst_sample: int = Query(default=1200, ge=500, le=3000, description="dst 샘플 크기"),
+    k: int = Query(default=15, ge=5, le=30, description="src당 후보 수"),
+    p_lo: float = Query(default=0.10, ge=0.0, le=0.5, description="하위 분위수"),
+    p_hi: float = Query(default=0.35, ge=0.1, le=1.0, description="상위 분위수"),
+    seed: int = Query(default=42, description="결정론적 샘플링용 시드"),
+    max_rounds: int = Query(default=3, ge=1, le=5, description="최대 재시도 횟수"),
+    mining_service: CandidateMiningService = Depends(get_candidate_mining_service),
+):
+    """
+    단일 배치 마이닝 실행.
+
+    샘플링 기반으로 src당 k개의 후보 페어를 생성합니다.
+    키셋 페이징을 사용하여 대용량 데이터셋에서도 안정적으로 동작합니다.
+
+    Args:
+        last_src_id: 마지막 처리한 src ID (키셋 페이징, 0부터 시작)
+        src_batch: 배치당 처리할 src 수 (기본 30)
+        dst_sample: dst 샘플 크기 (기본 1200)
+        k: src당 생성할 후보 수 (기본 15)
+        p_lo: 하위 분위수 (기본 0.10)
+        p_hi: 상위 분위수 (기본 0.35)
+        seed: 결정론적 샘플링용 시드 (기본 42)
+        max_rounds: 최대 재시도 횟수 (기본 3)
+
+    Returns:
+        {
+            "success": bool,
+            "new_last_src_id": int,  # 다음 배치의 시작점
+            "inserted_count": int,
+            "src_processed_count": int,
+            "rounds_used": int,
+            "band_lo": float,
+            "band_hi": float,
+            "avg_candidates_per_src": float,
+            "duration_ms": int
+        }
+
+    Example:
+        # 첫 번째 배치
+        POST /pipeline/mine-candidates/batch?last_src_id=0
+
+        # 두 번째 배치 (이전 응답의 new_last_src_id 사용)
+        POST /pipeline/mine-candidates/batch?last_src_id=30
+    """
+    try:
+        result = await mining_service.mine_batch(
+            last_src_id=last_src_id,
+            src_batch=src_batch,
+            dst_sample=dst_sample,
+            k=k,
+            p_lo=p_lo,
+            p_hi=p_hi,
+            seed=seed,
+            max_rounds=max_rounds
+        )
+
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("error"))
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mine batch failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/mine-candidates/full")
+async def mine_candidates_full(
+    src_batch: int = Query(default=30, ge=10, le=100, description="배치당 src 수"),
+    dst_sample: int = Query(default=1200, ge=500, le=3000, description="dst 샘플 크기"),
+    k: int = Query(default=15, ge=5, le=30, description="src당 후보 수"),
+    p_lo: float = Query(default=0.10, ge=0.0, le=0.5, description="하위 분위수"),
+    p_hi: float = Query(default=0.35, ge=0.1, le=1.0, description="상위 분위수"),
+    seed: int = Query(default=42, description="결정론적 샘플링용 시드"),
+    max_rounds: int = Query(default=3, ge=1, le=5, description="최대 재시도 횟수"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    mining_service: CandidateMiningService = Depends(get_candidate_mining_service),
+):
+    """
+    전체 마이닝 실행 (백그라운드).
+
+    모든 thought에 대해 마이닝을 실행합니다.
+    백그라운드로 실행되며 진행 상태는 GET /pipeline/mine-candidates/progress로 확인합니다.
+
+    Args:
+        src_batch: 배치당 처리할 src 수 (기본 30)
+        dst_sample: dst 샘플 크기 (기본 1200)
+        k: src당 생성할 후보 수 (기본 15)
+        p_lo: 하위 분위수 (기본 0.10)
+        p_hi: 상위 분위수 (기본 0.35)
+        seed: 결정론적 샘플링용 시드 (기본 42)
+        max_rounds: 최대 재시도 횟수 (기본 3)
+
+    Returns:
+        {
+            "success": true,
+            "message": "Full mining started in background"
+        }
+
+    Example:
+        POST /pipeline/mine-candidates/full
+    """
+    try:
+        logger.info("Starting full mining in background...")
+
+        # 백그라운드 태스크 추가
+        background_tasks.add_task(
+            mining_service.mine_full,
+            src_batch=src_batch,
+            dst_sample=dst_sample,
+            k=k,
+            p_lo=p_lo,
+            p_hi=p_hi,
+            seed=seed,
+            max_rounds=max_rounds
+        )
+
+        return {
+            "success": True,
+            "message": "Full mining started in background. Check /pipeline/mine-candidates/progress for status."
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to start full mining: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/mine-candidates/progress")
+async def get_mining_progress(
+    mining_service: CandidateMiningService = Depends(get_candidate_mining_service),
+):
+    """
+    마이닝 진행 상태 조회.
+
+    Returns:
+        {
+            "id": int,
+            "run_id": str,
+            "status": "pending"|"in_progress"|"completed"|"paused"|"failed",
+            "last_src_id": int,
+            "total_src_processed": int,
+            "total_pairs_inserted": int,
+            "avg_candidates_per_src": float,
+            "params": {...},
+            "started_at": str,
+            "updated_at": str,
+            "completed_at": str|None,
+            "error_message": str|None
+        }
+
+    Example:
+        GET /pipeline/mine-candidates/progress
+    """
+    try:
+        progress = await mining_service.get_progress()
+
+        if not progress:
+            return {
+                "status": "no_progress",
+                "message": "No mining progress found. Run /pipeline/mine-candidates/full first."
+            }
+
+        return progress
+
+    except Exception as e:
+        logger.error(f"Failed to get mining progress: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# 분포 스케치 엔드포인트 (신규)
+# ============================================================
+
+
+@router.post("/distribution/sketch/build")
+async def build_distribution_sketch(
+    seed: int = Query(default=42, description="결정론적 샘플링용 시드"),
+    src_sample: int = Query(default=200, ge=50, le=500, description="src 샘플 크기"),
+    dst_sample: int = Query(default=500, ge=100, le=1000, description="dst 샘플 크기"),
+    rounds: int = Query(default=1, ge=1, le=10, description="샘플링 라운드 수"),
+    exclude_same_memo: bool = Query(default=True, description="같은 메모 제외 여부"),
+    dist_service: DistributionService = Depends(get_distribution_service),
+):
+    """
+    전역 분포 스케치 빌드 (샘플 수집).
+
+    랜덤 샘플을 수집하여 전역 유사도 분포를 근사합니다.
+    권장: src=200, dst=500, rounds=1 → 10만 샘플
+
+    Args:
+        seed: 결정론적 샘플링용 시드
+        src_sample: src 샘플 크기 (기본 200)
+        dst_sample: dst 샘플 크기 (기본 500)
+        rounds: 샘플링 라운드 수 (기본 1)
+        exclude_same_memo: 같은 메모 제외 여부 (기본 True)
+
+    Returns:
+        {
+            "success": bool,
+            "run_id": str,
+            "inserted_samples": int,
+            "total_thoughts": int,
+            "coverage_estimate": float,
+            "duration_ms": int
+        }
+
+    Example:
+        POST /pipeline/distribution/sketch/build
+    """
+    try:
+        result = await dist_service.build_sketch(
+            seed=seed,
+            src_sample=src_sample,
+            dst_sample=dst_sample,
+            rounds=rounds,
+            exclude_same_memo=exclude_same_memo
+        )
+
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("error"))
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to build distribution sketch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/distribution/sketch/calculate")
+async def calculate_distribution_from_sketch(
+    run_id: Optional[str] = Query(default=None, description="특정 run의 샘플 사용 (NULL이면 최신)"),
+    supabase_service: SupabaseService = Depends(get_supabase_service),
+):
+    """
+    샘플 기반 전역 분포 계산.
+
+    similarity_samples 테이블의 샘플을 사용하여 p0-p100 백분위수를 계산하고
+    similarity_distribution_cache에 저장합니다.
+
+    Args:
+        run_id: 특정 run의 샘플 사용 (NULL이면 최신)
+
+    Returns:
+        {
+            "success": bool,
+            "distribution": {
+                "p0": float, "p10": float, ..., "p100": float,
+                "mean": float, "stddev": float
+            },
+            "cached": bool,
+            "is_approximate": bool,
+            "sample_count": int,
+            "duration_ms": int
+        }
+
+    Example:
+        POST /pipeline/distribution/sketch/calculate
+    """
+    try:
+        result = await supabase_service.calculate_distribution_from_sketch(
+            p_run_id=run_id
+        )
+
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("error"))
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to calculate distribution from sketch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

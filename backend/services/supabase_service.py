@@ -1761,7 +1761,336 @@ class SupabaseService:
             raise
 
     # ============================================================
-    # Distance Table 조회 (Phase 2: Distance Table Service)
+    # 샘플링 기반 마이닝 RPC (신규)
+    # ============================================================
+
+    async def mine_candidate_pairs(
+        self,
+        p_last_src_id: int = 0,
+        p_src_batch: int = 30,
+        p_dst_sample: int = 1200,
+        p_k: int = 15,
+        p_lo: float = 0.10,
+        p_hi: float = 0.35,
+        p_seed: int = 42,
+        p_max_rounds: int = 3
+    ) -> Dict[str, Any]:
+        """
+        샘플링 기반 후보 페어 마이닝 RPC 호출
+
+        Args:
+            p_last_src_id: 마지막 처리한 src ID (키셋 페이징)
+            p_src_batch: 배치당 src 수 (기본 30)
+            p_dst_sample: dst 샘플 크기 (기본 1200)
+            p_k: src당 후보 수 (기본 15)
+            p_lo: 하위 분위수 (기본 0.10)
+            p_hi: 상위 분위수 (기본 0.35)
+            p_seed: 결정론적 샘플링용 시드 (기본 42)
+            p_max_rounds: 최대 재시도 횟수 (기본 3)
+
+        Returns:
+            {
+                "success": bool,
+                "new_last_src_id": int,
+                "inserted_count": int,
+                "src_processed_count": int,
+                "rounds_used": int,
+                "band_lo": float,
+                "band_hi": float,
+                "avg_candidates_per_src": float,
+                "duration_ms": int
+            }
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await self.client.rpc(
+                "mine_candidate_pairs",
+                {
+                    "p_last_src_id": p_last_src_id,
+                    "p_src_batch": p_src_batch,
+                    "p_dst_sample": p_dst_sample,
+                    "p_k": p_k,
+                    "p_lo": p_lo,
+                    "p_hi": p_hi,
+                    "p_seed": p_seed,
+                    "p_max_rounds": p_max_rounds
+                }
+            ).execute()
+
+            if not response.data:
+                raise Exception("RPC returned no data")
+
+            result = response.data
+
+            if result.get("success"):
+                logger.info(
+                    f"mine_candidate_pairs: "
+                    f"{result.get('inserted_count')} pairs, "
+                    f"{result.get('src_processed_count')} sources, "
+                    f"{result.get('duration_ms')}ms"
+                )
+            else:
+                logger.error(f"mine_candidate_pairs failed: {result.get('error')}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"mine_candidate_pairs exception: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "new_last_src_id": p_last_src_id
+            }
+
+    async def build_distribution_sketch(
+        self,
+        p_seed: int = 42,
+        p_src_sample: int = 200,
+        p_dst_sample: int = 500,
+        p_rounds: int = 1,
+        p_exclude_same_memo: bool = True,
+        p_policy: str = "random_pairs"
+    ) -> Dict[str, Any]:
+        """
+        전역 분포 스케치용 샘플 수집 RPC 호출
+
+        Args:
+            p_seed: 결정론적 샘플링용 시드 (기본 42)
+            p_src_sample: src 샘플 크기 (기본 200)
+            p_dst_sample: dst 샘플 크기 (기본 500)
+            p_rounds: 샘플링 라운드 수 (기본 1)
+            p_exclude_same_memo: 같은 메모 제외 여부 (기본 TRUE)
+            p_policy: 샘플링 정책명 (기본 random_pairs)
+
+        Returns:
+            {
+                "success": bool,
+                "run_id": str,
+                "inserted_samples": int,
+                "total_thoughts": int,
+                "coverage_estimate": float,
+                "duration_ms": int
+            }
+        """
+        await self._ensure_initialized()
+
+        try:
+            response = await self.client.rpc(
+                "build_distribution_sketch",
+                {
+                    "p_seed": p_seed,
+                    "p_src_sample": p_src_sample,
+                    "p_dst_sample": p_dst_sample,
+                    "p_rounds": p_rounds,
+                    "p_exclude_same_memo": p_exclude_same_memo,
+                    "p_policy": p_policy
+                }
+            ).execute()
+
+            if not response.data:
+                raise Exception("RPC returned no data")
+
+            result = response.data
+
+            if result.get("success"):
+                logger.info(
+                    f"build_distribution_sketch: "
+                    f"{result.get('inserted_samples')} samples, "
+                    f"run_id={result.get('run_id')}, "
+                    f"{result.get('duration_ms')}ms"
+                )
+            else:
+                logger.error(f"build_distribution_sketch failed: {result.get('error')}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"build_distribution_sketch exception: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def calculate_distribution_from_sketch(
+        self,
+        p_run_id: str = None,
+        p_sample_limit: int = 100000
+    ) -> Dict[str, Any]:
+        """
+        샘플 기반 전역 분포 계산 RPC 호출
+
+        Args:
+            p_run_id: 특정 run의 샘플 사용 (NULL이면 최신)
+            p_sample_limit: 최대 샘플 수 (기본 100,000)
+
+        Returns:
+            {
+                "success": bool,
+                "distribution": {
+                    "p0": float, "p10": float, ..., "p100": float,
+                    "mean": float, "stddev": float
+                },
+                "cached": bool,
+                "is_approximate": bool,
+                "sample_count": int,
+                "duration_ms": int
+            }
+        """
+        await self._ensure_initialized()
+
+        try:
+            params = {"p_sample_limit": p_sample_limit}
+            if p_run_id:
+                params["p_run_id"] = p_run_id
+
+            response = await self.client.rpc(
+                "calculate_distribution_from_sketch",
+                params
+            ).execute()
+
+            if not response.data:
+                raise Exception("RPC returned no data")
+
+            result = response.data
+
+            if result.get("success"):
+                logger.info(
+                    f"calculate_distribution_from_sketch: "
+                    f"{result.get('sample_count')} samples, "
+                    f"cached={result.get('cached')}, "
+                    f"{result.get('duration_ms')}ms"
+                )
+            else:
+                logger.error(f"calculate_distribution_from_sketch failed: {result.get('error')}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"calculate_distribution_from_sketch exception: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    # ============================================================
+    # 마이닝 진행 상태 CRUD
+    # ============================================================
+
+    async def create_mining_progress(
+        self,
+        src_batch: int,
+        dst_sample: int,
+        k_per_src: int,
+        p_lo: float,
+        p_hi: float,
+        max_rounds: int,
+        seed: int
+    ) -> Dict[str, Any]:
+        """마이닝 진행 상태 레코드 생성"""
+        await self._ensure_initialized()
+
+        try:
+            data = {
+                "status": "in_progress",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "src_batch": src_batch,
+                "dst_sample": dst_sample,
+                "k_per_src": k_per_src,
+                "p_lo": p_lo,
+                "p_hi": p_hi,
+                "max_rounds": max_rounds,
+                "seed": seed
+            }
+
+            response = await (
+                self.client.table("pair_mining_progress")
+                .insert(data)
+                .execute()
+            )
+
+            if response.data:
+                logger.info(f"Created mining progress: id={response.data[0]['id']}")
+                return response.data[0]
+            else:
+                raise Exception("Insert returned no data")
+
+        except Exception as e:
+            logger.error(f"Failed to create mining progress: {e}")
+            raise
+
+    async def update_mining_progress(
+        self,
+        progress_id: int,
+        status: str,
+        last_src_id: int = None,
+        total_src_processed: int = None,
+        total_pairs_inserted: int = None,
+        avg_candidates_per_src: float = None,
+        error_message: str = None
+    ) -> Dict[str, Any]:
+        """마이닝 진행 상태 업데이트"""
+        await self._ensure_initialized()
+
+        try:
+            data = {
+                "status": status,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+
+            if last_src_id is not None:
+                data["last_src_id"] = last_src_id
+            if total_src_processed is not None:
+                data["total_src_processed"] = total_src_processed
+            if total_pairs_inserted is not None:
+                data["total_pairs_inserted"] = total_pairs_inserted
+            if avg_candidates_per_src is not None:
+                data["avg_candidates_per_src"] = avg_candidates_per_src
+            if error_message is not None:
+                data["error_message"] = error_message
+
+            if status == "completed":
+                data["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+            response = await (
+                self.client.table("pair_mining_progress")
+                .update(data)
+                .eq("id", progress_id)
+                .execute()
+            )
+
+            if response.data:
+                logger.debug(f"Updated mining progress: id={progress_id}, status={status}")
+                return response.data[0]
+            else:
+                raise Exception(f"Mining progress {progress_id} not found")
+
+        except Exception as e:
+            logger.error(f"Failed to update mining progress: {e}")
+            raise
+
+    async def get_mining_progress(self) -> Optional[Dict[str, Any]]:
+        """최신 마이닝 진행 상태 조회"""
+        await self._ensure_initialized()
+
+        try:
+            response = await (
+                self.client.table("pair_mining_progress")
+                .select("*")
+                .order("updated_at", desc=True)
+                .limit(1)
+                .maybe_single()
+                .execute()
+            )
+
+            return response.data
+
+        except Exception as e:
+            logger.error(f"Failed to get mining progress: {e}")
+            return None
+
+    # ============================================================
+    # Distance Table 조회 (레거시 - 향후 삭제 예정)
     # ============================================================
 
     async def get_candidates_from_distance_table(

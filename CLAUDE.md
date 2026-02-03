@@ -40,11 +40,12 @@ backend/
 ├── main.py
 ├── config.py
 ├── services/
-│   ├── supabase_service.py         # DB CRUD + pgvector
-│   ├── ai_service.py               # LLM calls
-│   ├── notion_service.py           # Notion API
-│   ├── distance_table_service.py   # Distance Table 관리 (NEW)
-│   └── rate_limiter.py             # API rate limiting
+│   ├── supabase_service.py             # DB CRUD + pgvector + RPC 호출
+│   ├── ai_service.py                   # LLM calls
+│   ├── notion_service.py               # Notion API
+│   ├── candidate_mining_service.py     # 샘플링 기반 후보 마이닝
+│   ├── distribution_service.py         # 전역 분포 계산
+│   └── rate_limiter.py                 # API rate limiting
 ├── routers/
 │   ├── pipeline.py                 # Pipeline endpoints
 │   └── essays.py                   # Essay CRUD
@@ -156,25 +157,65 @@ CREATE TABLE processing_status (
 );
 CREATE INDEX idx_processing_status_step_status ON processing_status(step, status);
 
--- 6. Distance Table: 모든 thought 페어의 유사도 사전 계산 (NEW)
-CREATE TABLE thought_pair_distances (
-    id BIGSERIAL PRIMARY KEY,
-    thought_a_id INTEGER NOT NULL REFERENCES thought_units(id) ON DELETE CASCADE,
-    thought_b_id INTEGER NOT NULL REFERENCES thought_units(id) ON DELETE CASCADE,
-    similarity FLOAT NOT NULL CHECK (similarity >= 0 AND similarity <= 1),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT tpd_different_thoughts CHECK (thought_a_id != thought_b_id),
-    CONSTRAINT tpd_ordered_pair CHECK (thought_a_id < thought_b_id),
-    CONSTRAINT tpd_unique_pair UNIQUE(thought_a_id, thought_b_id)
-);
-CREATE INDEX idx_tpd_similarity_range ON thought_pair_distances (similarity);
-CREATE INDEX idx_tpd_thought_a ON thought_pair_distances (thought_a_id);
-CREATE INDEX idx_tpd_thought_b ON thought_pair_distances (thought_b_id);
+-- 6. thought_units.rand_key: 결정론적 샘플링용 (NEW)
+-- thought_units 테이블에 rand_key 컬럼 추가
+ALTER TABLE thought_units ADD COLUMN rand_key DOUBLE PRECISION DEFAULT random();
+CREATE INDEX idx_thought_units_rand_key ON thought_units (rand_key);
 
--- Performance: 조회 0.1초 (vs 실시간 계산 60초+), 600배 개선
--- 저장 공간: 1,921개 기준 178MB (테이블 118MB + 인덱스 60MB)
--- Break-even: 7회 조회부터 이득
+-- 7. similarity_samples: 전역 분포 스케치용 샘플 저장 (NEW)
+CREATE TABLE similarity_samples (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL,
+    similarity FLOAT NOT NULL CHECK (similarity >= 0 AND similarity <= 1),
+    src_id INTEGER,  -- 디버깅용 (선택적)
+    dst_id INTEGER,  -- 디버깅용 (선택적)
+    seed INTEGER,
+    policy TEXT DEFAULT 'random_pairs',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_ss_run_id ON similarity_samples (run_id);
+CREATE INDEX idx_ss_created_at ON similarity_samples (created_at DESC);
+
+-- 8. pair_candidates: 마이닝된 후보 페어 (NEW)
+CREATE TABLE pair_candidates (
+    id SERIAL PRIMARY KEY,
+    thought_a_id INTEGER NOT NULL REFERENCES thought_units(id),
+    thought_b_id INTEGER NOT NULL REFERENCES thought_units(id),
+    similarity FLOAT NOT NULL,
+    raw_note_id_a UUID,
+    raw_note_id_b UUID,
+    llm_score INTEGER,
+    llm_status TEXT DEFAULT 'pending',
+    llm_attempts INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT pc_different CHECK (thought_a_id != thought_b_id),
+    CONSTRAINT pc_ordered CHECK (thought_a_id < thought_b_id),
+    UNIQUE(thought_a_id, thought_b_id)
+);
+CREATE INDEX idx_pc_similarity ON pair_candidates (similarity);
+CREATE INDEX idx_pc_llm_status ON pair_candidates (llm_status);
+
+-- 9. pair_mining_progress: 마이닝 진행 상태 추적 (NEW)
+CREATE TABLE pair_mining_progress (
+    id SERIAL PRIMARY KEY,
+    run_id UUID DEFAULT gen_random_uuid(),
+    last_src_id INTEGER NOT NULL DEFAULT 0,
+    total_src_processed INTEGER NOT NULL DEFAULT 0,
+    total_pairs_inserted BIGINT NOT NULL DEFAULT 0,
+    avg_candidates_per_src FLOAT,
+    src_batch INTEGER NOT NULL DEFAULT 30,
+    dst_sample INTEGER NOT NULL DEFAULT 1200,
+    k_per_src INTEGER NOT NULL DEFAULT 15,
+    p_lo FLOAT NOT NULL DEFAULT 0.10,
+    p_hi FLOAT NOT NULL DEFAULT 0.35,
+    max_rounds INTEGER NOT NULL DEFAULT 3,
+    seed INTEGER NOT NULL DEFAULT 42,
+    status TEXT NOT NULL DEFAULT 'in_progress',
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    error_message TEXT
+);
 
 -- pgvector extension
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -190,16 +231,15 @@ POST /pipeline/select-pairs          # Step 3: ZK 페어 선택
 POST /pipeline/generate-essays       # Step 4: Essay 생성
 POST /pipeline/run-all               # 전체 파이프라인
 
-# Hybrid C Strategy (NEW)
-POST /pipeline/collect-candidates    # 전체 후보 수집 (Distance Table 사용, 0.1초)
-POST /pipeline/sample-initial        # 초기 100개 샘플 평가
-POST /pipeline/score-candidates      # 배치 평가 (백그라운드)
-GET  /essays/recommended             # AI 추천 Essay 후보 조회
+# Candidate Mining (샘플링 기반)
+POST /mine-candidates/batch          # 단일 배치 마이닝 (30 src × 1200 dst)
+POST /mine-candidates/full           # 전체 마이닝 (모든 thought 처리)
+GET  /mine-candidates/progress       # 마이닝 진행 상태 조회
 
-# Distance Table (NEW)
-POST /pipeline/distance-table/build  # Distance Table 초기 구축 (~7분, 한 번만 실행)
-GET  /pipeline/distance-table/status # Distance Table 통계 조회
-POST /pipeline/distance-table/update # Distance Table 증분 갱신 (~2초/10개)
+# Distribution Sketch (전역 분포 근사)
+POST /distribution/sketch/build      # 분포 샘플 수집 (~100K 샘플)
+POST /distribution/sketch/calculate  # 분포 계산 (p0-p100)
+GET  /distribution                   # 캐시된 분포 조회
 
 # Essays
 GET  /essays                         # Essay 목록 조회
@@ -274,72 +314,225 @@ RETURNS jsonb AS $$
 $$ LANGUAGE plpgsql;
 ```
 
-## Distance Table (초고속 유사도 조회)
+## 샘플링 기반 후보 마이닝 아키텍처
 
-Distance Table은 모든 thought 페어의 유사도를 사전 계산하여 저장하는 기능입니다.
+기존 Distance Table 방식(전쌍 계산 O(N²))을 대체하는 샘플링 기반 접근법입니다.
 
-### 성능 개선
-- **조회 속도**: 0.1초 (vs 실시간 계산 60초+), **600배 개선**
-- **조회 범위**: 무제한 (80% 범위 검증 완료, 100,000개 안전 상한선)
-- **증분 갱신**: 신규 10개 추가 시 ~2초
+### 아키텍처 개요
 
-### 저장 공간
-- **1,921개 기준**: 178MB (테이블 118MB + 인덱스 60MB)
-- **복잡도**: N×(N-1)/2 페어 (예: 1,921개 → 1.84M 페어)
-- **Break-even**: 7회 조회부터 이득
+| 축 | 목적 | RPC | 복잡도 |
+|----|------|-----|--------|
+| **(A) Candidate Mining** | src당 10-20개 후보 생성 | `mine_candidate_pairs()` | O(N×k) |
+| **(B) Distribution Sketch** | 전역 분포 근사 (p0-p100) | `build_distribution_sketch()` | O(샘플수) |
 
-### 사용 방법
+### 성능 비교
 
-#### 1. 초기 구축 (한 번만 실행)
-```bash
-POST /pipeline/distance-table/build?batch_size=50
-# 예상 시간: 1,921개 기준 ~7분 (순차 배치 처리)
+| 항목 | Distance Table (폐기) | 샘플링 기반 (현재) |
+|------|----------------------|-------------------|
+| 초기 구축 | ~7분 | ~3초 |
+| 저장 공간 | 178MB | ~5MB |
+| 복잡도 | O(N²) | O(N×k) |
+| 증분 갱신 | 필요 | 불필요 |
+
+---
+
+## rand_key 기반 결정론적 샘플링
+
+### rand_key란?
+
+`thought_units` 테이블의 각 row에 저장된 0~1 사이의 랜덤 값입니다.
+
+```sql
+ALTER TABLE thought_units ADD COLUMN rand_key DOUBLE PRECISION DEFAULT random();
+CREATE INDEX idx_thought_units_rand_key ON thought_units (rand_key);
 ```
 
-#### 2. 증분 갱신 (자동 또는 수동)
-```bash
-# 자동: extract-thoughts 완료 후 (신규 10개 이상일 때)
-POST /pipeline/extract-thoughts?auto_update_distance_table=true
+### 왜 rand_key를 사용하는가?
 
-# 수동: 언제든지 트리거 가능
-POST /pipeline/distance-table/update
+**기존 방식의 문제점:**
+```sql
+-- ❌ ORDER BY random(): 매번 다른 결과, 비효율적
+SELECT * FROM thought_units ORDER BY random() LIMIT 200;
+
+-- ❌ TABLESAMPLE: 비결정론적, seed 재현 어려움
+SELECT * FROM thought_units TABLESAMPLE BERNOULLI(10);
 ```
 
-#### 3. 통계 조회
-```bash
-GET /pipeline/distance-table/status
-# 응답: total_pairs, min/max/avg similarity
+**rand_key 방식의 장점:**
+```sql
+-- ✅ rand_key: 결정론적, 인덱스 활용, 재현 가능
+SELECT * FROM thought_units
+WHERE rand_key >= 0.000042  -- seed 기반 시작점
+ORDER BY rand_key
+LIMIT 200;
 ```
 
-#### 4. 후보 수집 (Distance Table 사용)
-```bash
-POST /pipeline/collect-candidates?use_distance_table=true
-# 기본값: use_distance_table=true (권장)
-# fallback: use_distance_table=false (v4 RPC, 60초+)
+### Seed → 시작점 변환
+
+```
+seed=42
+   ↓
+(42 % 1000000) / 1000000.0 = 0.000042
+   ↓
+rand_key >= 0.000042 인 row부터 순서대로 선택
 ```
 
-### 구현 세부사항
+### 샘플링 흐름도
 
-#### RPC 함수
-1. **build_distance_table_batch**: 단일 배치 처리 (Python에서 순차 호출)
-   - 배치 크기: 25-100 (권장 50)
-   - 실행 시간: ~10초/배치
-   - 타임아웃 회피: 각 배치 60초 미만 보장
+```
+seed=42
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ rand_key 축 (0 ~ 1)                                      │
+│                                                          │
+│ 0.000042                              0.500042           │
+│    ↓                                     ↓               │
+│    [====== src 200개 ======]    [====== dst 500개 ======]│
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+    ↓
+CROSS JOIN: 200 × 500 = 100,000 페어
+    ↓
+각 페어의 cosine similarity 계산
+    ↓
+similarity_samples 테이블에 저장
+    ↓
+PERCENTILE_CONT로 p0 ~ p100 계산
+```
 
-2. **update_distance_table_incremental**: 증분 갱신
-   - 자동 감지: thought_pair_distances에 없는 thought 자동 감지
-   - 신규 × 기존 페어 생성
-   - 신규 × 신규 페어 생성
+---
 
-#### 인덱스 전략
-- `idx_tpd_similarity_range`: 유사도 범위 조회 최적화 (핵심!)
-- `idx_tpd_thought_a`, `idx_tpd_thought_b`: thought 기반 조회
+## 전역 분포 스케치 (Distribution Sketch)
 
-#### 파일 위치
-- **Service**: `backend/services/distance_table_service.py`
-- **SQL**: `backend/docs/supabase_migrations/010_create_distance_table.sql`
-- **RPC**: `backend/docs/supabase_migrations/011_build_distance_table_rpc.sql`
-- **RPC**: `backend/docs/supabase_migrations/012_incremental_update_rpc.sql`
+### 목적
+
+전쌍 계산(N²) 없이 유사도 분포를 **근사**합니다.
+
+### RPC: build_distribution_sketch()
+
+```sql
+SELECT build_distribution_sketch(
+    p_seed := 42,           -- 결정론적 샘플링 시드
+    p_src_sample := 200,    -- src 샘플 크기
+    p_dst_sample := 500,    -- dst 샘플 크기
+    p_rounds := 1,          -- 샘플링 라운드
+    p_exclude_same_memo := TRUE,  -- 같은 메모 제외
+    p_policy := 'random_pairs'
+);
+```
+
+### 샘플 수 계산
+
+```
+총 샘플 수 = src_sample × dst_sample × rounds
+
+예시:
+- 200 × 500 × 1 = 100,000 샘플
+- 100 × 500 × 2 = 100,000 샘플
+```
+
+### RPC: calculate_distribution_from_sketch()
+
+저장된 샘플에서 백분위수를 계산합니다:
+
+```sql
+SELECT calculate_distribution_from_sketch();
+-- 결과: p0, p10, p20, ..., p90, p100, mean, stddev
+```
+
+### 샘플 확인 쿼리
+
+```sql
+-- 현재 샘플 수 확인
+SELECT COUNT(*) FROM similarity_samples;
+
+-- 최신 run_id의 샘플 수
+SELECT run_id, COUNT(*), MIN(created_at), MAX(created_at)
+FROM similarity_samples
+GROUP BY run_id
+ORDER BY MAX(created_at) DESC
+LIMIT 1;
+```
+
+---
+
+## 후보 마이닝 (Candidate Mining)
+
+### 목적
+
+각 thought(src)에 대해 적절한 유사도 범위의 후보 k개를 생성합니다.
+
+### RPC: mine_candidate_pairs()
+
+```sql
+SELECT mine_candidate_pairs(
+    p_last_src_id := 0,     -- 키셋 페이징 (OFFSET 금지)
+    p_src_batch := 30,      -- 배치당 src 수
+    p_dst_sample := 1200,   -- dst 샘플 크기
+    p_k := 15,              -- src당 후보 수
+    p_lo := 0.10,           -- 하위 분위수 (밴드 하한)
+    p_hi := 0.35,           -- 상위 분위수 (밴드 상한)
+    p_seed := 42,           -- 샘플링 시드
+    p_max_rounds := 3       -- 최대 재시도
+);
+```
+
+### 밴드 필터링 원리
+
+```
+전체 유사도 분포:
+|  매우 낮음  |  낮음  |  중간  |  높음  |  매우 높음  |
+0.0         0.10    0.20    0.35    0.50         1.0
+            ↑                ↑
+          p_lo             p_hi
+            └───── 밴드 ─────┘
+            (창의적 조합 영역)
+```
+
+- **p_lo (0.10)**: 너무 관련 없는 페어 제외
+- **p_hi (0.35)**: 너무 유사한 페어 제외 (새로운 통찰 없음)
+
+### 파라미터 권장값
+
+| 파라미터 | 기본값 | 범위 | 설명 |
+|---------|--------|------|------|
+| src_batch | 30 | 20-40 | 배치당 src 수 |
+| dst_sample | 1200 | 800-1500 | dst 샘플 크기 |
+| k | 15 | 10-20 | src당 후보 수 |
+| p_lo | 0.10 | 0.05-0.15 | 하위 분위수 |
+| p_hi | 0.35 | 0.25-0.45 | 상위 분위수 |
+
+### 키셋 페이징
+
+OFFSET 대신 `id > last_src_id` 방식으로 페이징:
+
+```sql
+-- ❌ OFFSET: 느리고 불안정
+SELECT * FROM thought_units OFFSET 1000 LIMIT 30;
+
+-- ✅ 키셋 페이징: 빠르고 안정적
+SELECT * FROM thought_units WHERE id > 1000 ORDER BY id LIMIT 30;
+```
+
+---
+
+## 파일 위치
+
+### SQL Migrations
+- `backend/docs/supabase_migrations/015_add_rand_key.sql`
+- `backend/docs/supabase_migrations/016_create_mining_progress.sql`
+- `backend/docs/supabase_migrations/017_create_similarity_samples.sql`
+- `backend/docs/supabase_migrations/018_mine_candidate_pairs_rpc.sql`
+- `backend/docs/supabase_migrations/019_build_distribution_sketch_rpc.sql`
+- `backend/docs/supabase_migrations/020_calculate_distribution_from_sketch_rpc.sql`
+
+### Python Services
+- `backend/services/candidate_mining_service.py` - 후보 마이닝 서비스
+- `backend/services/distribution_service.py` - 분포 계산 서비스
+- `backend/services/supabase_service.py` - RPC 호출 메서드
+
+### 통합 Migration
+- `backend/docs/supabase_migrations/MIGRATION_COMBINED_015_020.sql` - 모든 DDL + RPC 통합
 
 ## LLM Tasks
 
@@ -447,14 +640,20 @@ BATCH_SIZE=10
 MAX_RETRIES=3
 
 # pgvector
-SIMILARITY_MIN=0.05  # 낮은 유사도 = 서로 다른 아이디어, 창의적 조합
-SIMILARITY_MAX=0.35  # 너무 유사하면 새로운 통찰이 없음
 EMBEDDING_DIMENSION=1536
 
-# Distance Table (NEW)
-USE_DISTANCE_TABLE=true        # Distance Table 사용 여부 (기본 true)
-DISTANCE_TABLE_BATCH_SIZE=50   # 초기 구축 배치 크기 (25-100)
-AUTO_UPDATE_DISTANCE_TABLE=true # extract-thoughts 후 자동 갱신 (기본 true)
+# 샘플링 기반 마이닝 (NEW)
+MINING_SRC_BATCH=30            # 배치당 src 수
+MINING_DST_SAMPLE=1200         # dst 샘플 크기
+MINING_K_PER_SRC=15            # src당 후보 수
+MINING_P_LO=0.10               # 밴드 하한 (하위 분위수)
+MINING_P_HI=0.35               # 밴드 상한 (상위 분위수)
+MINING_SEED=42                 # 결정론적 샘플링 시드
+
+# 분포 스케치 (NEW)
+SKETCH_SRC_SAMPLE=200          # src 샘플 크기
+SKETCH_DST_SAMPLE=500          # dst 샘플 크기
+SKETCH_ROUNDS=1                # 샘플링 라운드 (200×500×1 = 100K 샘플)
 ```
 
 ## Code Conventions

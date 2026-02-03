@@ -5,6 +5,9 @@
 - 절대값 하드코딩 제거
 - 데이터 특성에 맞게 자동 조정
 - 캐싱으로 성능 최적화
+
+변경 이력:
+- 2026-02: Distance Table 방식 → 샘플링 기반 스케치 방식으로 전환
 """
 
 from typing import Optional, Tuple, Dict, Any
@@ -17,12 +20,29 @@ logger = logging.getLogger(__name__)
 class DistributionService:
     """유사도 분포 계산 및 상대적 임계값 제공"""
 
+    # 기본 분포값 (스케치 미존재 시 폴백)
+    DEFAULT_DISTRIBUTION = {
+        "thought_count": 0,
+        "total_pairs": 0,
+        "percentiles": {
+            "p0": 0.0, "p10": 0.05, "p20": 0.10, "p30": 0.15,
+            "p40": 0.20, "p50": 0.25, "p60": 0.30, "p70": 0.35,
+            "p80": 0.40, "p90": 0.50, "p100": 1.0
+        },
+        "mean": 0.25,
+        "stddev": 0.15,
+        "calculated_at": None,
+        "duration_ms": 0,
+        "is_approximate": True,
+        "is_default": True
+    }
+
     def __init__(self, supabase_service):
         self.supabase = supabase_service
         self._cache: Optional[Dict[str, Any]] = None
         self._cache_timestamp: Optional[datetime] = None
         self._memory_cache_ttl = timedelta(minutes=5)
-        self._db_cache_ttl = timedelta(days=7)  # 7일 TTL (Distance Table 재계산 타임아웃 방지)
+        self._db_cache_ttl = timedelta(days=7)  # 7일 TTL
 
     async def get_distribution(
         self,
@@ -33,18 +53,23 @@ class DistributionService:
 
         캐싱 전략:
             - 메모리 캐시: 5분 TTL
-            - DB 캐시: 24시간 TTL
-            - 재계산 트리거: 24시간 경과 OR 데이터 10% 변화
+            - DB 캐시: 7일 TTL
+            - 재계산 트리거: force_recalculate=True OR 캐시 없음 OR 7일 경과
+
+        변경사항 (2026-02):
+            - Distance Table → 샘플링 기반 스케치 방식으로 전환
+            - is_approximate=True 필드 추가 (근사값임을 명시)
 
         Returns:
             {
                 "thought_count": 1921,
-                "total_pairs": 38420,
+                "total_pairs": 100000,  # 샘플 수 (전쌍 아님)
                 "percentiles": {"p0": 0.26, "p10": 0.30, ...},
                 "mean": 0.38,
                 "stddev": 0.05,
                 "calculated_at": "2026-01-26T10:00:00",
-                "duration_ms": 5432
+                "duration_ms": 5432,
+                "is_approximate": True
             }
         """
         # 1. 메모리 캐시 확인
@@ -64,22 +89,89 @@ class DistributionService:
         )
 
         if needs_recalc:
-            logger.info("Recalculating similarity distribution from Distance Table...")
-            result = await self.supabase.calculate_distribution_from_distance_table()
+            logger.info("Recalculating similarity distribution from sketch...")
+            result = await self.supabase.calculate_distribution_from_sketch()
 
             if not result.get("success"):
-                raise Exception(f"Failed to calculate distribution: {result.get('error')}")
+                # 스케치가 없는 경우 기본값 반환 + 경고
+                error_msg = result.get("error", "Unknown error")
+                logger.warning(
+                    f"Distribution calculation failed: {error_msg}. "
+                    f"Using default distribution. "
+                    f"Run build_distribution_sketch() to create samples."
+                )
+
+                # 기본값 반환
+                default_dist = self.DEFAULT_DISTRIBUTION.copy()
+                default_dist["calculated_at"] = datetime.now().isoformat()
+
+                self._cache = default_dist
+                self._cache_timestamp = datetime.now()
+                return default_dist
 
             # DB 캐시 다시 조회
             db_cache = await self.supabase.get_similarity_distribution_cache()
+
+            if db_cache is None:
+                logger.warning("DB cache still empty after recalculation")
+                return self.DEFAULT_DISTRIBUTION.copy()
         else:
             logger.info("Distribution cache hit (DB)")
 
-        # 4. 메모리 캐시 갱신
+        # 4. 메모리 캐시 갱신 + is_approximate 추가
+        db_cache["is_approximate"] = True
         self._cache = db_cache
         self._cache_timestamp = datetime.now()
 
         return db_cache
+
+    async def build_sketch(
+        self,
+        seed: int = 42,
+        src_sample: int = 200,
+        dst_sample: int = 500,
+        rounds: int = 1,
+        exclude_same_memo: bool = True
+    ) -> Dict[str, Any]:
+        """
+        전역 분포 스케치 빌드 (샘플 수집)
+
+        Args:
+            seed: 결정론적 샘플링용 시드
+            src_sample: src 샘플 크기
+            dst_sample: dst 샘플 크기
+            rounds: 샘플링 라운드 수
+
+        Returns:
+            {
+                "success": bool,
+                "run_id": str,
+                "inserted_samples": int,
+                "duration_ms": int
+            }
+        """
+        logger.info(
+            f"Building distribution sketch: "
+            f"src={src_sample}, dst={dst_sample}, rounds={rounds}"
+        )
+
+        result = await self.supabase.build_distribution_sketch(
+            p_seed=seed,
+            p_src_sample=src_sample,
+            p_dst_sample=dst_sample,
+            p_rounds=rounds,
+            p_exclude_same_memo=exclude_same_memo
+        )
+
+        if result.get("success"):
+            logger.info(
+                f"Sketch built: {result.get('inserted_samples')} samples, "
+                f"run_id={result.get('run_id')}"
+            )
+        else:
+            logger.error(f"Sketch build failed: {result.get('error')}")
+
+        return result
 
     async def get_relative_thresholds(
         self,
@@ -141,7 +233,7 @@ class DistributionService:
         return age < self._memory_cache_ttl
 
     def _is_db_cache_stale(self, db_cache: Dict[str, Any]) -> bool:
-        """DB 캐시가 오래되었는지 확인 (24시간 TTL)"""
+        """DB 캐시가 오래되었는지 확인 (7일 TTL)"""
         calculated_at_str = db_cache.get("calculated_at")
         if not calculated_at_str:
             return True
@@ -190,7 +282,7 @@ def get_distribution_service():
         ):
             ...
     """
-    from backend.services.supabase_service import get_supabase_service
+    from services.supabase_service import get_supabase_service
 
     global _distribution_service
     if _distribution_service is None:
